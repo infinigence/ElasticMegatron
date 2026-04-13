@@ -1,6 +1,7 @@
 from copy import deepcopy
 from typing import Tuple
 import torch
+from megatron.core import parallel_state
 from megatron.training.global_vars import get_args
 from .resharding_metadata import ParamReshardingMetaData, get_tensor_parallel_attr
 from .resharding_pp import ParamPositionAttr, PipelineParallelReshardingInfo, LayerType
@@ -249,6 +250,12 @@ class VirtualParam:
             )
         )
 
+        # if self.param_position_attr.layer_type == LayerType.OUTPUT_LAYER:
+        #     print(f"rank {torch.distributed.get_rank()} (dp{parallel_state.get_data_parallel_rank()}-tp{parallel_state.get_tensor_model_parallel_rank()}-pp{parallel_state.get_pipeline_model_parallel_rank()}) | src distribution: {data_parallel_resharding_info.src_dp_distribution}"
+        #         f"dst distribution: {data_parallel_resharding_info.dst_dp_distribution}",
+        #         flush=True
+        #     )
+
         return ReshardPlan(
             tensor_parallel_resharding_info=tensor_parallel_resharding_info,
             pipeline_parallel_resharding_info=pipeline_parallel_resharding_info,
@@ -354,6 +361,7 @@ class VirtualParamSpace:
             )
 
         # Get DP distribution
+        # pp != 0 时disable bucket 参见DistributedDataParallel的定义
         for model_chunk_idx, stage_virtual_params in enumerate(stages_virtual_params):
             overlap_param_gather_with_optimizer_step = getattr(
                 args, "overlap_param_gather_with_optimizer_step", False
@@ -385,6 +393,7 @@ class VirtualParamSpace:
         elif dst_megatron_state.training_state is not None:
             ddp_config = dst_megatron_state.training_state.model[0].ddp_config
 
+        # 这里第一次会构建Virtual params, 并且生成dp分布情况, 并进行cache
         self.build_model_virtual_params(
             src_megatron_state.parallel_strategy, ddp_config
         )
@@ -393,6 +402,11 @@ class VirtualParamSpace:
         )
         for virtual_param in self.all_virtual_params:
             virtual_param.clear_optimizer_tensor_info()
+            # 为这个参数生成TP plan (划分chunk和映射)
+            # PP plan (src stage -> dst stage)
+            # EP plan (ep src -> dst)
+            # DP plan (包含上述，并且包含dp distribution)
+            # 并设置为 current_reshard_plan
             virtual_param.apply_reshard_plan(
                 src_megatron_state.parallel_strategy,
                 dst_megatron_state.parallel_strategy,

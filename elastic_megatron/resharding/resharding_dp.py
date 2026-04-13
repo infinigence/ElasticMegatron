@@ -262,6 +262,9 @@ def get_ddp_buffer_distribution(
     def get_bucket_params_distribution(
         bucket: _ParamAndGradBucket,
     ) -> list[dict["VirtualParam", Range]]:
+        """
+        返回每个dp上, 若某个param的opt tensor落在该dp上时, opt tensor在bucket中的range
+        """
         bucket_start_index, bucket_end_index = bucket_indices[bucket.bucket_id]
         bucket_numel = bucket_end_index - bucket_start_index
         bucket_params: list["VirtualParam"] = bucket.params_list
@@ -295,6 +298,11 @@ def get_ddp_buffer_distribution(
         return dp_to_params_distribution
 
     def get_buckets_params_distribution() -> list[dict["VirtualParam", Range]]:
+        """
+        返回每个dp上, 
+        buffer中所有bucket的opt tensor的range
+        range.global_offset = param_global_offset_in_buffer
+        """
         dp_to_params_distribution: list[dict["VirtualParam", Range]] = [
             {} for i in range(data_parallel_size)
         ]

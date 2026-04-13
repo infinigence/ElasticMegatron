@@ -102,6 +102,12 @@ class Range:
         assert self.is_contain(sub_range)
         return tuple([slice(sub_range.start, sub_range.end)])
 
+    def __str__(self):
+        return f"Range([{self.start},{self.end}) [size={self.size}])"
+
+    def __repr__(self):
+        return str(self)
+
 
 class ParamRange:
     def __init__(
@@ -202,9 +208,10 @@ class ParamRange:
         return self.size
 
     def __str__(self):
-        msg = ""
+        msg = "ParamRange("
         for i, shape in enumerate(self.shapes):
             msg += f"dim{i} = {str(shape)}  "
+        msg += ")"
         return msg
 
     def __repr__(self):

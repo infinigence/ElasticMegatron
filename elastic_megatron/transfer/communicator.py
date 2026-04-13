@@ -1,6 +1,15 @@
+from collections import defaultdict
+from dataclasses import dataclass
 from typing import Dict, List, Set, Callable
 import torch
 import queue
+
+
+@dataclass
+class CommunicationBytes:
+    send: Dict[int, int]
+    recv: Dict[int, int]
+    total: int
 
 
 class Communicator:
@@ -27,6 +36,8 @@ class Communicator:
         self.dummy_tensor = torch.empty(1, device=torch.cuda.current_device())
 
         # Record communication bytes
+        self._communication_bytes_send = defaultdict(int)
+        self._communication_bytes_recv = defaultdict(int)
         self._communication_bytes = 0
         self._group_to_ranks: Dict[torch.distributed.ProcessGroup, List[int]] = {
             None: [i for i in range(torch.distributed.get_world_size())]
@@ -73,6 +84,7 @@ class Communicator:
         self.send_fn(tensor.contiguous(), dst=dst, *args, **kwargs)
 
         self._communication_bytes += tensor.nbytes
+        self._communication_bytes_send[dst] += tensor.nbytes
 
     def recv(
         self,
@@ -94,6 +106,7 @@ class Communicator:
             self.recv_fn(tensor, src=src, *args, **kwargs)
 
         self._communication_bytes += tensor.nbytes
+        self._communication_bytes_recv[src] += tensor.nbytes
 
     def broadcast(
         self,
@@ -115,8 +128,14 @@ class Communicator:
         if self._rank in group_ranks:
             self._communication_bytes += tensor.nbytes
 
-    def get_communication_bytes(self) -> float:
+    def get_communication_bytes(self) -> CommunicationBytes:
         """Get the communication bytes(GB) and reset the communication bytes to 0"""
         communication_bytes = self._communication_bytes
+        communication_bytes_send = self._communication_bytes_send
+        communication_bytes_recv = self._communication_bytes_recv
         self._communication_bytes = 0
-        return communication_bytes / (1024**3)
+        self._communication_bytes_send = defaultdict(int)
+        self._communication_bytes_recv = defaultdict(int)
+        return CommunicationBytes(
+            communication_bytes_send, communication_bytes_recv, communication_bytes
+        )
