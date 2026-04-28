@@ -97,16 +97,32 @@ from . import one_logger_utils
 
 from . import ft_integration
 
-from tools.agent.env_utils import trigger_new_node,ElasticEnv,ElasticMode
+from tools.elastic_control.env_utils import trigger_new_node, ElasticEnv, ElasticMode
+from tools.elastic_control.elastic_overlay import (
+    attach_ipc_state_if_async_sender_proxy,
+    sender_proxy_redeploy,
+    is_overlay_new_process,
+    ipc_sender,
+    launch_async_overlay_processes,
+    redeploy_transfer,
+    sync_training_state,
+    update_async_overlay_ready_state,
+    _overlay_enabled,
+)
 _PARALLEL_STRATEGY_LIST = None
+
 
 def check_reshard(iteration):
     elastic_signal = False
     ready_signal = torch.tensor([0], dtype=torch.int, device="cuda")
-    if iteration == 5:
+    from tools.elastic_control.env_utils import _parse_elastic_trigger_iters
+
+    _, _, trigger_iters = _parse_elastic_trigger_iters()
+
+    if iteration in trigger_iters:
         elastic_signal = True
     
-    from tools.agent.env_utils import _get_ready_flag
+    from tools.elastic_control.env_utils import _get_ready_flag
     if torch.distributed.get_rank() == 0:
         if _get_ready_flag() == 1:
             ready_signal[0] = 1
@@ -137,9 +153,10 @@ def init_parallel_strategy_list():
             "sequence_parallel": args.sequence_parallel,
         },
         {
-            "world_size": 4,
+            #sym:init_parallel_strategy_list
+            "world_size": 8,
             "tensor_model_parallel_size": 2,
-            "pipeline_model_parallel_size": 1,
+            "pipeline_model_parallel_size": 4,
         },
     ]
 
@@ -412,7 +429,7 @@ def pretrain(
     app_metrics['app_build_optimizer_start_time'] = one_logger_utils.get_timestamp_in_ms()
 
     init_parallel_strategy_list()
-    from tools.agent.env_utils import meta_resharding_for_inter_process
+    from tools.elastic_control.env_utils import meta_resharding_for_inter_process
     if ElasticEnv.is_scale_up() or ElasticEnv.is_new_node() or ElasticEnv.is_scale_down():
         model, optimizer, opt_param_scheduler = meta_resharding_for_inter_process(model_provider, model_type, checkpointing_context)
     elif ElasticEnv.is_scale_down_receiver():
@@ -1482,6 +1499,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     eval_duration = 0.0
     eval_iterations = 0
 
+    if _overlay_enabled() and attach_ipc_state_if_async_sender_proxy(
+        model, optimizer, opt_param_scheduler
+    ):
+        iteration = int(args.iteration)
+        start_iteration = iteration
+        args.curr_iteration = iteration
+        num_microbatches = get_num_microbatches()
+        if hasattr(args, "num_floating_point_operations_so_far"):
+            num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
+        num_floating_point_operations_since_last_log_event = 0.0
+
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics.
         """
@@ -1535,21 +1563,97 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Run training iterations till done.
+    overlay_enabled = _overlay_enabled()
     has_triggered_scale = False
+    triggered_scale_iters = set()
+    scale_up_iter = None
+    scale_down_iter = None
+    # scale_action = ElasticMode.SCALE_DOWN
+    #sym:scale_action
     scale_action = ElasticMode.SCALE_DOWN
-    # scale_action = ElasticMode.SCALE_UP
+
+    if not overlay_enabled:
+        if (
+            ElasticEnv.is_new_process()
+            or ElasticEnv.is_new_node()
+            or ElasticEnv.is_scale_down_receiver()
+        ):
+            triggered_scale_iters.add(iteration)
+            print_rank_0(
+                f"[elastic-trigger] skip retrigger at restored iteration={iteration} "
+                f"env(new_process={ElasticEnv.is_new_process()}, new_node={ElasticEnv.is_new_node()}, "
+                f"scale_down_receiver={ElasticEnv.is_scale_down_receiver()})"
+            )
+        from tools.elastic_control.env_utils import _parse_elastic_trigger_iters
+
+        scale_up_iter, scale_down_iter, _ = _parse_elastic_trigger_iters()
     while iteration < args.train_iters:
-        elastic_signal, ready_signal = check_reshard(iteration)
-        if elastic_signal and not has_triggered_scale and not ElasticEnv.is_scale_up() and not ElasticEnv.is_new_node() and not ElasticEnv.is_new_process():
-            if int(os.environ.get("LOCAL_RANK", 0)) == 0:
-                from tools.agent.env_utils import _start_new_megatron_proc
-                _start_new_megatron_proc(scale_action)
-                if torch.distributed.get_rank() == 0 and scale_action == ElasticMode.SCALE_UP:
-                    trigger_new_node()
-            has_triggered_scale = True
-        if has_triggered_scale and ready_signal:
-            from elastic_megatron.transfer.ipc_manager import send_training_state
-            send_training_state(model, optimizer, iteration, opt_param_scheduler)
+        if overlay_enabled:
+            if not is_overlay_new_process():
+                launch_async_overlay_processes(iteration)
+                update_async_overlay_ready_state()
+
+            if sender_proxy_redeploy():
+                overlay_redeploy_result = redeploy_transfer(
+                    iteration,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    local_trigger_iter=iteration,
+                )
+                if overlay_redeploy_result == "sender_exit":
+                    should_exit = True
+                    exit_code = 0
+                    break
+
+            if ipc_sender(iteration, model, optimizer, opt_param_scheduler):
+                should_exit = True
+                exit_code = 0
+                break
+        else:
+            elastic_signal, ready_signal = check_reshard(iteration)
+            active_scale_action = scale_action
+            if scale_up_iter is not None and iteration == scale_up_iter:
+                active_scale_action = ElasticMode.SCALE_UP
+            elif scale_down_iter is not None and iteration == scale_down_iter:
+                active_scale_action = ElasticMode.SCALE_DOWN
+
+            allow_new_node_trigger = active_scale_action == ElasticMode.SCALE_DOWN
+            if (
+                elastic_signal
+                and iteration not in triggered_scale_iters
+                and (allow_new_node_trigger or not ElasticEnv.is_new_node())
+            ):
+                if active_scale_action == ElasticMode.SCALE_DOWN:
+                    os.environ["ELASTIC_IPC_PORT"] = os.environ.get(
+                        "ELASTIC_IPC_PORT_SCALE_DOWN", "7000"
+                    )
+                else:
+                    os.environ["ELASTIC_IPC_PORT"] = os.environ.get(
+                        "ELASTIC_IPC_PORT", "6000"
+                    )
+
+                print_rank_0(
+                    f"[elastic-trigger] iteration={iteration} action={'SCALE_DOWN' if active_scale_action == ElasticMode.SCALE_DOWN else 'SCALE_UP'} "
+                    f"env(scale_up={ElasticEnv.is_scale_up()}, new_process={ElasticEnv.is_new_process()}, new_node={ElasticEnv.is_new_node()})"
+                )
+
+                if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+                    from tools.elastic_control.env_utils import _start_new_megatron_proc
+                    _start_new_megatron_proc(active_scale_action)
+                    if (
+                        torch.distributed.get_rank() == 0
+                        and active_scale_action == ElasticMode.SCALE_UP
+                    ):
+                        # Scale-up now launches new nodes through ssh from rank0.
+                        trigger_new_node()
+                has_triggered_scale = True
+                triggered_scale_iters.add(iteration)
+            if has_triggered_scale and ready_signal:
+                from elastic_megatron.transfer.ipc_manager import send_training_state
+
+                send_training_state(model, optimizer, iteration, opt_param_scheduler)
+                has_triggered_scale = False
 
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
             if args.use_pytorch_profiler:
@@ -1597,6 +1701,26 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                                      checkpointing_context, train_data_iterator=train_data_iterator)
         if should_exit:
             break
+
+        if overlay_enabled:
+            overlay_redeploy_result = redeploy_transfer(
+                iteration, model, optimizer, opt_param_scheduler
+            )
+            if overlay_redeploy_result == "sender_exit":
+                should_exit = True
+                exit_code = 0
+                break
+            synced = sync_training_state(
+                overlay_redeploy_result,
+                args=args,
+                get_num_microbatches_fn=get_num_microbatches,
+            )
+            if synced is not None:
+                iteration, start_iteration = synced[0], synced[0]
+                num_microbatches = synced[1]
+                num_floating_point_operations_so_far = synced[2]
+                num_floating_point_operations_since_last_log_event = 0.0
+                continue
 
         # Enable forward pre-hooks after first set of forward and backward passes.
         # When running in fp16, skip all NaN iterations until steady-state loss scaling value
