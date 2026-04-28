@@ -225,7 +225,7 @@ MODE=scale_up \
     /workpath/run_inter_process.sh
 ```
 
-#### 参数说明
+#### Parameters
 
 - `*_SRC_TP` / `*_SRC_PP`：Source Tensor/Pipeline Parallelism before scaling
 - `*_TGT_TP` / `*_TGT_PP`：Target Tensor/Pipeline Parallelism after scaling

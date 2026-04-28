@@ -1645,7 +1645,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                         torch.distributed.get_rank() == 0
                         and active_scale_action == ElasticMode.SCALE_UP
                     ):
-                        # Scale-up now launches new nodes through ssh from rank0.
+                        # Scale-up launches new nodes through ssh from rank0.
                         trigger_new_node()
                 has_triggered_scale = True
                 triggered_scale_iters.add(iteration)
