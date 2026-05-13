@@ -4,25 +4,26 @@ set -ex
 export PYTHONHASHSEED=1234
 export TORCH_MANUAL_SEED=1234
 
-BASE_PATH=/workspace
+BASE_PATH=${BASE_PATH:-/workspace}
 MEGATRON_PATH=${MEGATRON_PATH:-${BASE_PATH}/Megatron-LM}
-export PYTHONPATH=${BASE_PATH}/ElasticMegatron:${MEGATRON_PATH}
+export PYTHONPATH="${BASE_PATH}/ElasticMegatron:${MEGATRON_PATH}"
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 
 export OMP_NUM_THREADS=8
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-TP=${TP:-1}
-PP=${PP:-1}
-export CUDA_VISIBLE_DEVICES="0"
+TP=1
+PP=1
 
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
-NNODES=${NNODES:-2}
-
+NNODES=${NNODES:-1}
 NODE_RANK=${RANK:-0}
-GPUS_PER_NODE=8
+GPUS_PER_NODE=4
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
+
+export ELASTIC_TRANSFER_LOG_LEVEL=1
+export ELASTIC_USE_ASYNCBUFFER_P2P=1
 
 
 # Network size variables
@@ -30,6 +31,8 @@ export MODEL_SIZE=${MODEL_SIZE:-"tiny"}
 
 if   [ ${MODEL_SIZE} == 7 ];   then HIDDEN_SIZE=4096;  NUM_HEAD=32; NUM_QUERY_GROUP=32; NUM_LAYERS=32; FFN_HIDDEN_SIZE=11008; NORM_EPS=1e-5;
 elif [ ${MODEL_SIZE} == 13 ];  then HIDDEN_SIZE=5120;  NUM_HEAD=40; NUM_QUERY_GROUP=40; NUM_LAYERS=40; FFN_HIDDEN_SIZE=13824; NORM_EPS=1e-5;
+elif [ ${MODEL_SIZE} == 16 ]; then HIDDEN_SIZE=6656;  NUM_HEAD=64; NUM_QUERY_GROUP=32; NUM_LAYERS=32; FFN_HIDDEN_SIZE=23296; NORM_EPS=1e-5;
+elif [ ${MODEL_SIZE} == 32 ]; then HIDDEN_SIZE=6656;  NUM_HEAD=64; NUM_QUERY_GROUP=32; NUM_LAYERS=60; FFN_HIDDEN_SIZE=23296; NORM_EPS=1e-5;
 elif [ ${MODEL_SIZE} == 70 ];  then HIDDEN_SIZE=8192;  NUM_HEAD=64; NUM_QUERY_GROUP=8;  NUM_LAYERS=80; FFN_HIDDEN_SIZE=28672; NORM_EPS=1e-5;
 elif [ ${MODEL_SIZE} == 130 ];  then HIDDEN_SIZE=12288;  NUM_HEAD=96; NUM_QUERY_GROUP=8;  NUM_LAYERS=88; FFN_HIDDEN_SIZE=31232; NORM_EPS=1e-5;
 elif [ ${MODEL_SIZE} == "tiny" ]; then HIDDEN_SIZE=128;  NUM_HEAD=4; NUM_QUERY_GROUP=4; NUM_LAYERS=4; FFN_HIDDEN_SIZE=512; NORM_EPS=1e-5;
@@ -44,12 +47,31 @@ MAX_POSITION_EMBEDDINGS=4096
 
 DATA_CACHE_PATH=${BASE_PATH}/data/data_cache
 TOKENIZER_PATH=${BASE_PATH}/tokenizer.model
-SAVE_PATH=${BASE_PATH}/log
 
 SRC_PATH=${MEGATRON_PATH}/pretrain_gpt.py
 export LOG_DIR=${LOG_DIR:-${BASE_PATH}/log}
-LOG_PATH=${LOG_DIR}/node${NODE_RANK}.log
-mkdir -p ${LOG_DIR}
+mkdir -p "${LOG_DIR}"
+
+# Use a shared timestamp across nodes: prefer externally provided TIME_PREFIX.
+if [ -n "${TIME_PREFIX:-}" ]; then
+  time_prefix="${TIME_PREFIX}"
+else
+  rendezvous_file="${LOG_DIR}/.time_prefix_${MASTER_ADDR//[^a-zA-Z0-9_.-]/_}_${MASTER_PORT}"
+  if [ "${NODE_RANK}" -eq 0 ]; then
+    time_prefix=$(TZ='UTC-8' date +%Y%m%d-%H%M%S)
+    printf '%s\n' "${time_prefix}" > "${rendezvous_file}"
+  else
+    until [ -s "${rendezvous_file}" ]; do sleep 1; done
+    read -r time_prefix < "${rendezvous_file}"
+  fi
+fi
+
+time_prefix=${MODEL_SIZE}B_${time_prefix}
+
+LOG_PATH=${LOG_DIR}/${time_prefix}/node_${NODE_RANK}.log
+mkdir -p ${LOG_DIR}/${time_prefix}
+
+export SAVE_PATH=${LOG_DIR}/${time_prefix}
 
 LAUNCHER=" \
        torchrun \
@@ -93,6 +115,7 @@ NETWORK_SIZE_ARGS=" \
        --no-masked-softmax-fusion \
        --no-position-embedding \
        --use-mcore-models \
+       --normalization RMSNorm \
        " 
 
 LOGGING_ARGS="
@@ -112,7 +135,7 @@ REGULATIZATION_ARGS=" \
 TRAINING_ARGS=" \
        --micro-batch-size ${MBS} \
        --global-batch-size ${GBS} \
-       --train-iters 100 \
+       --train-iters 20 \
        --log-interval 1 \
        --optimizer adam \
        "
@@ -133,7 +156,9 @@ LEARNING_RATE_ARGS=" \
        --min-lr 3e-5 \
        "
 
-CHECKPOINTING_ARGS=""
+CHECKPOINTING_ARGS=" \
+       --no-save-optim \
+"
 
 MIXED_PRECISION_ARGS=" \
        --bf16 \
@@ -142,7 +167,7 @@ MIXED_PRECISION_ARGS=" \
 
 VALIDATION_ARGS=" \
        --eval-interval 10000 \
-       --eval-iters 1 \
+       --eval-iters 0 \
        --save ${SAVE_PATH} \
        --save-interval 1000000 \
        "

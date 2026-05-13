@@ -158,10 +158,11 @@ class ElasticMegatronManager:
     def log_communication_info(
         self, transfer_time: float, union_world_group, logger: Logger | None = None
     ):
+        local_comm_info = self.transfer_manager.communicator.get_communication_bytes()
         info = torch.tensor(
             [
                 transfer_time,
-                self.transfer_manager.communicator.get_communication_bytes(),
+                local_comm_info.total,
             ],
             device=torch.cuda.current_device(),
             dtype=torch.float32,
@@ -170,7 +171,23 @@ class ElasticMegatronManager:
         with with_world_group(union_world_group):
             torch.distributed.all_reduce(info, op=torch.distributed.ReduceOp.MAX)
 
+
+        obj_list = [None] * torch.distributed.get_world_size(group=union_world_group)
+        with with_world_group(union_world_group):
+            torch.distributed.all_gather_object(obj_list, local_comm_info)
+
+        if self._rank == 0:
+            print("-"*40+"SendRecv Info"+"-"*40)
+            for src_rank in range(len(obj_list)):
+                comm_info = obj_list[src_rank]
+                sorted_send = sorted(comm_info.send.items(), key=lambda x: x[0])
+                sorted_recv = sorted(comm_info.recv.items(), key=lambda x: x[0])
+                sum_send_recv = sum(send[1] for send in sorted_send) + sum(recv[1] for recv in sorted_recv)
+                print(f"src_rank={src_rank}, send={sorted_send}, recv={sorted_recv}, sum_send_recv={sum_send_recv/1000/1000/1000:.2f} GB")
+            print("-"*40+"-"*40)
+
         transfer_time, communication_bytes = info.tolist()
+        communication_bytes /= (1000 * 1000 * 1000)
         msg = f"[ElasticMegatron-Perf] : transfer time: {transfer_time:.2f} ms, communication bytes: {communication_bytes:.2f} GB, bandwidth: {1000 * communication_bytes / (transfer_time):.2f} GB/s"
         if logger is not None:
             logger.info(msg)

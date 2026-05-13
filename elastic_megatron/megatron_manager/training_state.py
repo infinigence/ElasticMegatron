@@ -341,11 +341,9 @@ class TrainingState:
         args.use_dist_ckpt = False
 
         if save_path is None:
-            cwd = pathlib.Path.cwd()
+            cwd = pathlib.Path(os.environ["SAVE_PATH"])
             save_dir = (
-                cwd.parent
-                / "ElasticMegatron"
-                / "tools"
+                cwd
                 / "ckpt"
                 / ("before_reshard" if is_before_reshard else "after_reshard")
             )

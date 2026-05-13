@@ -67,9 +67,6 @@ class Range:
         assert global_offset <= self.start
         return Range(self.start - global_offset, self.end - global_offset)
 
-    def __str__(self):
-        return "%d,%d [%d]" % (self.start, self.end, self.size)
-
     def __len__(self):
         return self.end - self.start
 
@@ -101,6 +98,12 @@ class Range:
 
         assert self.is_contain(sub_range)
         return tuple([slice(sub_range.start, sub_range.end)])
+
+    def __str__(self):
+        return f"Range([{self.start},{self.end}) [size={self.size}])"
+
+    def __repr__(self):
+        return str(self)
 
 
 class ParamRange:
@@ -202,9 +205,10 @@ class ParamRange:
         return self.size
 
     def __str__(self):
-        msg = ""
+        msg = "ParamRange("
         for i, shape in enumerate(self.shapes):
             msg += f"dim{i} = {str(shape)}  "
+        msg += ")"
         return msg
 
     def __repr__(self):
