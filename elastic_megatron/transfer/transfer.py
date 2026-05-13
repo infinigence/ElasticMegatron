@@ -650,24 +650,15 @@ class TransferManager:
 
                 process_fn(virtual_param)
 
-        use_block_and_print = False
+        process_virtual_params(self._pre_process)
+        all_vps = virtual_param_space.all_virtual_params
+        self._main_process_batch(all_vps)
+        process_virtual_params(self._post_process)
+        self.transfer_word_embedding_and_output_layer(
+            virtual_param_space.all_virtual_params[0],
+            virtual_param_space.all_virtual_params[-1],
+        )
 
-        with Timer() as t1:
-            process_virtual_params(self._pre_process)
-        with Timer() as t2:
-            all_vps = virtual_param_space.all_virtual_params
-            self._main_process_batch(all_vps)
-            # process_virtual_params(self._main_process)
-        with Timer() as t3:
-            process_virtual_params(self._post_process)
-
-        with Timer() as t4:
-            self.transfer_word_embedding_and_output_layer(
-                virtual_param_space.all_virtual_params[0],
-                virtual_param_space.all_virtual_params[-1],
-            )
-
-        return t1.elapsed, t2.elapsed, t3.elapsed, t4.elapsed
 
     def redundant_backup(
         self,

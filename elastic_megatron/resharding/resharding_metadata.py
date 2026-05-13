@@ -488,7 +488,6 @@ def generate_resharding_metadata(
 def update_layer_index(
     params_to_resharding_metadata: Dict[torch.nn.Parameter, ParamReshardingMetaData],
 ):
-    # 把所有的stage从0开始？因为position attr是从名字里来的？
     # Key = tuple(LayerType, transformer_layer_id)
     dense_layer_index_dict: dict[tuple[LayerType, int], int] = {}
 

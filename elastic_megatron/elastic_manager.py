@@ -67,13 +67,6 @@ class ElasticMegatronManager:
                 parallel_state.get_inter_partial_data_parallel_group
             )
 
-        # if self._rank == 0:
-        #     print(f"{len(model)=}, {type(model[0])=}")
-        #     print(f"{'name':<80} {'shape':<20} {'dtype':<10}")
-        #     for model_chunk in model:
-        #         for name, param in model_chunk.named_parameters():
-        #             print(f"{name:<80} {str(list(param.shape)):<20} {str(param.dtype):<10}")
-
     def _init_transfer_manager(
         self, send_fn: Callable, recv_fn: Callable, broadcast_fn: Callable
     ):
@@ -124,17 +117,7 @@ class ElasticMegatronManager:
             transfer_context = build_nccl_connection_context(self.transfer_manager)
 
         with with_world_group(union_world_group), transfer_context, Timer() as t:
-            times = self.transfer_manager.transfer_optimizer_tensors(self.virtual_param_space)
-
-        all_times = [None] * torch.distributed.get_world_size(group=union_world_group)
-        torch.distributed.all_gather_object(all_times, times)
-
-        if self._rank == 0:
-            print("-"*40+"Transfer Times of each stage"+"-"*40)
-            for src_rank in range(len(all_times)):
-                pre, main, post, emb = all_times[src_rank]
-                print(f"src_rank={src_rank:>3}, pre={pre:>8.2f} ms, main={main:>8.2f} ms, post={post:>8.2f} ms, emb={emb:>8.2f} ms, total={pre+main+post+emb:>8.2f} ms")
-            print("-"*40+"-"*40)
+            self.transfer_manager.transfer_optimizer_tensors(self.virtual_param_space)
 
         return t.elapsed
 
@@ -237,8 +220,6 @@ class ElasticMegatronManager:
             )
 
         # Step-1 : Generate src/dst megatron states.
-        # 这个步骤之后，mpu通信组切换为dst_state，src的raw_weight释放，dst的raw_weight, opt等都建立，然后释放raw_weight
-        # 最后剩下src和dst的opt
         src_megatron_state, dst_megatron_state, union_world_group = (
             self.state_manager.reshard(new_parallel_strategy, is_meta_device)
         )
@@ -278,7 +259,6 @@ class ElasticMegatronManager:
             src_megatron_state.training_state.release_optimizer()
 
         # Step-5 : Update model weight.
-        # 先rebuild dst raw_weight，然后_copy_main_params_to_model_params
         if dst_megatron_state.training_state is not None:
             dst_megatron_state.training_state.update_model_weight()
 

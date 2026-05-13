@@ -1,8 +1,6 @@
 from typing import Dict, List
 from contextlib import contextmanager
 import torch
-
-from megatron.core import parallel_state
 from .mpu_state import MPUState, get_union_world_group
 from .training_state import TrainingState
 from .parallel_strategy import ParallelStrategy
@@ -15,54 +13,6 @@ from ..distributed import ElasticProcessGroup
 
 WORLD_GROUP = None
 
-def print_mem_usage(label: str):
-    if not torch.cuda.is_available():
-        return
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    memory_stats = torch.tensor(
-        [
-            float(torch.cuda.memory_allocated()),
-            float(torch.cuda.memory_reserved()),
-        ],
-        device=torch.cuda.current_device(),
-        dtype=torch.float64,
-    )
-
-    gather_list = None
-    if rank == 0:
-        gather_list = [
-            torch.zeros_like(memory_stats) for _ in range(world_size)
-        ]
-    torch.distributed.gather(memory_stats, gather_list=gather_list, dst=0)
-
-    if rank != 0:
-        return
-
-    divider = "-" * 62
-    # print label, length 62, fill with -
-    print(f"{label:-^62}", flush=True)
-    print(
-        f"{'Rank':>6} | {'Allocated (GB)':>18} | {'Reserved (GB)':>18}",
-        flush=True,
-    )
-    print(divider, flush=True)
-    for i, item in enumerate(gather_list):
-        allocated_gb = item[0].item() / (1024**3)
-        reserved_gb = item[1].item() / (1024**3)
-        print(
-            f"{i:>6} | {allocated_gb:>18.4f} | {reserved_gb:>18.4f}",
-            flush=True,
-        )
-    print(divider, flush=True)
-
-
-def print_parallel_state(label: str):
-    print(f"[rank {torch.distributed.get_rank()}] "
-            f"{label}: (dp, tp, pp) = ({parallel_state.get_data_parallel_rank()}, "
-            f"{parallel_state.get_tensor_model_parallel_rank()}, "
-            f"{parallel_state.get_pipeline_model_parallel_rank()})",
-            flush=True)
 
 def set_world_group(group: ElasticProcessGroup | None):
     global WORLD_GROUP
@@ -225,11 +175,7 @@ class MegatronStateManager:
         dst_megatron_state: MegatronState = self._parallel_strategy_to_megatron_state[
             str(new_parallel_strategy)
         ]
-        # print_mem_usage("Before apply")
-        # print_parallel_state("Before apply")
         self.apply(parallel_strategy=new_parallel_strategy)
-        # print_parallel_state("After apply")
-
 
         # Get union world group and ranks
         union_world_group, union_world_ranks = get_union_world_group(
@@ -248,7 +194,6 @@ class MegatronStateManager:
                 f"{is_meta_device=} but {src_megatron_state.training_state.is_meta_device=}"
             )
             src_megatron_state.training_state.release_model()
-            # print_mem_usage("After release src model")
 
         # Setup dst training state
         if (
@@ -259,12 +204,10 @@ class MegatronStateManager:
             dst_megatron_state.training_state = TrainingState.setup_model_and_optimizer(
                 is_meta_device=is_meta_device
             )
-            # print_mem_usage("After setup dst training state")
             dst_megatron_state.training_state.init_metadata(
                 dst_megatron_state.parallel_strategy, offload_opt_tensors=True
             )
             dst_megatron_state.training_state.release_model()
-            # print_mem_usage("After release dst model")
 
         return src_megatron_state, dst_megatron_state, union_world_group
 

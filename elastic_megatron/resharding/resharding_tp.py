@@ -156,35 +156,6 @@ class TensorParallelAttr:
 
         # Scale-up : split src_tensor and send split results to dst_ranks
         if src_parallel_group_size < dst_parallel_group_size:
-            """
-            dim = 0, param_shape = [4096, 4096]
-            tp=2 -> tp=4
-            send_info = {
-                0: {
-                    0: Range(0, 1024),
-                    1: Range(1024, 2048),
-                },
-                1: {
-                    2: Range(2048, 3072),
-                    3: Range(3072, 4096),
-                },
-            }
-
-            recv_info = {
-                0: {
-                    0: Range(0, 1024)
-                },
-                1: {
-                    0: Range(1024, 2048)
-                },
-                2: {
-                    1: Range(2048, 3072)
-                },
-                3: {
-                    1: Range(3072, 4096)
-                },
-            }
-            """
             # Split src tensor
             scale_up_ratio = dst_parallel_group_size // src_parallel_group_size
             src_param_range_chunks: List[ParamRange] = src_param_range.chunk(
@@ -202,35 +173,6 @@ class TensorParallelAttr:
             return TensorParallelReshardingInfo(
                 send_info=send_info, recv_info=recv_info
             )
-
-        """
-        tp=4 -> tp=2
-        send_info = {
-            0: {
-                0: Range(0, 1024)
-            },
-            1: {
-                0: Range(1024, 2048)
-            },
-            2: {
-                1: Range(2048, 3072)
-            },
-            3: {
-                1: Range(3072, 4096)
-            }
-
-        }
-        recv_info = {
-            0: {
-                0: Range(0, 1024),
-                1: Range(1024, 2048),
-            },
-            1: {
-                2: Range(2048, 3072),
-                3: Range(3072, 4096),
-            }
-        }
-        """
 
         # Scale-down : split dst tensor and recv src tensors from src_ranks
         scale_down_ratio = src_parallel_group_size // dst_parallel_group_size

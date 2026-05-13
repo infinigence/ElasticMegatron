@@ -4,15 +4,15 @@ set -ex
 export PYTHONHASHSEED=1234
 export TORCH_MANUAL_SEED=1234
 
-BASE_PATH=/mnt/public/yuanqwang/flextrain
-MEGATRON_PATH=/mnt/public/yuanqwang/flextrain/Megatron-LM-011
+BASE_PATH=${BASE_PATH:-/workspace}
+MEGATRON_PATH=${MEGATRON_PATH:-${BASE_PATH}/Megatron-LM}
 export PYTHONPATH="${BASE_PATH}/ElasticMegatron:${MEGATRON_PATH}"
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 
 export OMP_NUM_THREADS=8
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CONFIG_PY=/mnt/public/yuanqwang/flextrain/Megatron-LM-011/megatron/training/set_config.py
+CONFIG_PY=${MEGATRON_PATH}/megatron/training/set_config.py
 TP=$(python ${CONFIG_PY} tp)
 PP=$(python ${CONFIG_PY} pp)
 # export CUDA_VISIBLE_DEVICES="0"
@@ -207,7 +207,3 @@ CMD="${LAUNCHER} \
 
 echo ${CMD} | tee ${LOG_PATH}
 ${CMD} 2>&1 | tee -a ${LOG_PATH}
-
-if [ $NODE_RANK == 0 ]; then
-    python /mnt/public/yuanqwang/flextrain/testcode/load_log.py $LOG_PATH | tee -a ${LOG_PATH}
-fi

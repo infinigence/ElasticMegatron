@@ -173,16 +173,11 @@ class TrainingState:
                 self.optimizer_tensor_info_list.append(optimizer_tensor_info)
                 self.optimizer_tensor_list += optimizer_tensor_info.optimizer_tensors
 
-    def update_model_weight(self, model_only: bool = False):
+    def update_model_weight(self):
         if self.is_meta_device:
             return
         if self.model_offloaded:
             self.rebuild_model()
-
-        if model_only:
-            for ddp_model in self.model:
-                ddp_model.broadcast_params()
-            return
 
         # Copy main params to model params
         if isinstance(self.optimizer, ChainedOptimizer):
