@@ -36,6 +36,7 @@ class TransferManager:
             log_level=int(os.getenv("ELASTIC_TRANSFER_LOG_LEVEL", "1")),
             log_option="minmax",
         )
+        self.use_asyncbuffer_p2p = os.getenv("ELASTIC_USE_ASYNCBUFFER_P2P", "0") == "1"
 
     def set_fake_transfer(self, fake_transfer: bool):
         self.fake_transfer = fake_transfer
@@ -435,6 +436,18 @@ class TransferManager:
                     offset += nbytes
             return packed
 
+        def _unpack_tensors(
+            packed: torch.Tensor, peer_tensors: List[torch.Tensor]
+        ) -> None:
+            """Inverse of :func:`_pack_tensors`: scatter ``packed`` back into
+            the original tensors in the same order they were packed."""
+            offset = 0
+            for tensor in peer_tensors:
+                tensor_bytes = tensor.view(torch.uint8).reshape(-1)
+                nbytes = tensor_bytes.numel()
+                tensor_bytes.copy_(packed[offset : offset + nbytes])
+                offset += nbytes
+
         self._transfer_timers("Pack peer tensors", log_level=1).start()
         num_steps = 1 << ((world_size - 1).bit_length())
         for step in range(1, num_steps):
@@ -477,14 +490,7 @@ class TransferManager:
 
             self._transfer_timers("Unpack recv tensors", log_level=1).start()
             for packed_recv_tensor, original_recv_tensors in recv_unpack_tasks:
-                offset = 0
-                for recv_tensor in original_recv_tensors:
-                    recv_tensor_bytes = recv_tensor.view(torch.uint8).reshape(-1)
-                    nbytes = recv_tensor_bytes.numel()
-                    recv_tensor_bytes.copy_(
-                        packed_recv_tensor[offset : offset + nbytes],
-                    )
-                    offset += nbytes
+                _unpack_tensors(packed_recv_tensor, original_recv_tensors)
             self._transfer_timers("Unpack recv tensors").stop()
             self._transfer_timers("Copy recv tensors", log_level=1).start()
             for recv_optimizer_tensor, recv_buffer in recv_copy_back:
@@ -612,8 +618,10 @@ class TransferManager:
                 process_fn(virtual_param)
 
         process_virtual_params(self._pre_process)
-        all_vps = virtual_param_space.all_virtual_params
-        self._main_process_batch(all_vps)
+        if self.use_asyncbuffer_p2p:
+            self._main_process_batch(virtual_param_space.all_virtual_params)
+        else:
+            process_virtual_params(self._main_process)
         process_virtual_params(self._post_process)
         self.transfer_word_embedding_and_output_layer(
             virtual_param_space.all_virtual_params[0],
