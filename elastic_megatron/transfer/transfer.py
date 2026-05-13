@@ -2,7 +2,6 @@ from collections import defaultdict
 import os
 from typing import Dict, List, Tuple, Callable
 import torch
-import torch.distributed as dist
 from .communicator import Communicator
 
 
@@ -66,8 +65,7 @@ class TransferManager:
             src_optimizer_tensor_info.release()
             return
 
-        p2p_ops: List[dist.P2POp] = []
-        send_buffers: List[torch.Tensor] = []
+        batch = self.communicator.batch_p2p()
         for dst_rank, send_param_range in send_transfer_range_dict.items():
             transfer_param_slices: Tuple[slice] = (
                 src_model_param_range.get_sub_range_slices(send_param_range)
@@ -77,22 +75,8 @@ class TransferManager:
                 send_optimizer_tensor = src_optimizer_tensor.view(
                     src_model_param_shape
                 )[transfer_param_slices]
-                if dst_rank == self._rank:
-                    self.send(send_optimizer_tensor, dst=dst_rank)
-                    continue
-
-                send_buffer = send_optimizer_tensor.contiguous()
-                send_buffers.append(send_buffer)
-                p2p_ops.append(dist.P2POp(dist.isend, send_buffer, dst_rank))
-                self.communicator._communication_bytes += send_buffer.nbytes
-                self.communicator._communication_bytes_send[dst_rank] += (
-                    send_buffer.nbytes
-                )
-
-        if p2p_ops:
-            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
+                batch.isend(send_optimizer_tensor, dst=dst_rank)
+        batch.wait()
         src_optimizer_tensor_info.release()
 
     def _recv_optimizer_tensors(
@@ -118,8 +102,7 @@ class TransferManager:
                 self.recv(None, src=src_rank)
             return
 
-        p2p_ops: List[dist.P2POp] = []
-        recv_copy_back: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        batch = self.communicator.batch_p2p()
         for src_rank, recv_param_range in recv_transfer_range_dict.items():
             transfer_param_slices: Tuple[slice] = (
                 dst_model_param_range.get_sub_range_slices(recv_param_range)
@@ -130,30 +113,8 @@ class TransferManager:
                 recv_optimizer_tensor = dst_optimizer_tensor.view(
                     dst_model_param_shape
                 )[transfer_param_slices]
-                if src_rank == self._rank:
-                    self.recv(recv_optimizer_tensor, src=src_rank)
-                    continue
-
-                if recv_optimizer_tensor.is_contiguous():
-                    recv_buffer = recv_optimizer_tensor
-                else:
-                    recv_buffer = torch.empty_like(
-                        recv_optimizer_tensor, memory_format=torch.contiguous_format
-                    )
-                    recv_copy_back.append((recv_optimizer_tensor, recv_buffer))
-
-                p2p_ops.append(dist.P2POp(dist.irecv, recv_buffer, src_rank))
-                self.communicator._communication_bytes += recv_optimizer_tensor.nbytes
-                self.communicator._communication_bytes_recv[src_rank] += (
-                    recv_optimizer_tensor.nbytes
-                )
-
-        if p2p_ops:
-            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
-            for recv_optimizer_tensor, recv_buffer in recv_copy_back:
-                recv_optimizer_tensor.data.copy_(recv_buffer)
+                batch.irecv(recv_optimizer_tensor, src=src_rank)
+        batch.wait()
 
     def transfer_word_embedding_and_output_layer(
         self, word_embedding: VirtualParam, output_layer: VirtualParam
@@ -356,10 +317,6 @@ class TransferManager:
                 send_buffer = send_optimizer_tensor.contiguous()
                 send_buffers.append(send_buffer)
                 send_tasks[dst_rank].append(send_buffer)
-                self.communicator._communication_bytes += send_buffer.nbytes
-                self.communicator._communication_bytes_send[dst_rank] += (
-                    send_buffer.nbytes
-                )
         src_to_release.append(src_optimizer_tensor_info)
 
     def _collect_recv_tasks_for_virtual_param(
@@ -424,10 +381,6 @@ class TransferManager:
                     recv_copy_back.append((recv_optimizer_tensor, recv_buffer))
 
                 recv_tasks[src_rank].append(recv_buffer)
-                self.communicator._communication_bytes += recv_optimizer_tensor.nbytes
-                self.communicator._communication_bytes_recv[src_rank] += (
-                    recv_optimizer_tensor.nbytes
-                )
 
     def _main_process_batch(self, virtual_params: List[VirtualParam]):
         send_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
@@ -457,7 +410,7 @@ class TransferManager:
             )
         self._transfer_timers("Main process batch").stop()
 
-        p2p_ops: List[dist.P2POp] = []
+        batch = self.communicator.batch_p2p()
         world_size = torch.distributed.get_world_size()
 
         def _pack_tensors(
@@ -498,28 +451,28 @@ class TransferManager:
             packed_recv_tensor = None
             if peer_sends:
                 packed_send_tensor = _pack_tensors(peer_sends)
-                send_buffers.append(packed_send_tensor)
             if peer_recvs:
                 packed_recv_tensor = _pack_tensors(peer_recvs, False)
                 recv_unpack_tasks.append((packed_recv_tensor, peer_recvs))
 
+            # Order send/recv to avoid potential deadlocks: the lower-ranked
+            # peer enqueues send first, the higher-ranked peer enqueues recv
+            # first. ``BatchP2P`` preserves enqueue order in the op list.
             if self._rank < peer:
                 if packed_send_tensor is not None:
-                    p2p_ops.append(dist.P2POp(dist.isend, packed_send_tensor, peer))
+                    batch.isend(packed_send_tensor, dst=peer)
                 if packed_recv_tensor is not None:
-                    p2p_ops.append(dist.P2POp(dist.irecv, packed_recv_tensor, peer))
+                    batch.irecv(packed_recv_tensor, src=peer)
             else:
                 if packed_recv_tensor is not None:
-                    p2p_ops.append(dist.P2POp(dist.irecv, packed_recv_tensor, peer))
+                    batch.irecv(packed_recv_tensor, src=peer)
                 if packed_send_tensor is not None:
-                    p2p_ops.append(dist.P2POp(dist.isend, packed_send_tensor, peer))
+                    batch.isend(packed_send_tensor, dst=peer)
         self._transfer_timers("Pack peer tensors").stop()
 
-        if p2p_ops:
+        if batch.has_ops():
             self._transfer_timers("Real transfer", log_level=1).start()
-            reqs = torch.distributed.batch_isend_irecv(p2p_ops)
-            for req in reqs:
-                req.wait()
+            batch.wait()
             self._transfer_timers("Real transfer").stop()
 
             self._transfer_timers("Unpack recv tensors", log_level=1).start()
@@ -536,6 +489,14 @@ class TransferManager:
             self._transfer_timers("Copy recv tensors", log_level=1).start()
             for recv_optimizer_tensor, recv_buffer in recv_copy_back:
                 recv_optimizer_tensor.data.copy_(recv_buffer)
+            self._transfer_timers("Copy recv tensors").stop()
+        else:
+            # for timer synchronization, otherwise will get stuck
+            self._transfer_timers("Real transfer", log_level=1).start()
+            self._transfer_timers("Real transfer").stop()
+            self._transfer_timers("Unpack recv tensors", log_level=1).start()
+            self._transfer_timers("Unpack recv tensors").stop()
+            self._transfer_timers("Copy recv tensors", log_level=1).start()
             self._transfer_timers("Copy recv tensors").stop()
 
         self._transfer_timers("Release optimizer tensors", log_level=1).start()
@@ -658,7 +619,6 @@ class TransferManager:
             virtual_param_space.all_virtual_params[0],
             virtual_param_space.all_virtual_params[-1],
         )
-
 
     def redundant_backup(
         self,

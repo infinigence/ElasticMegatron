@@ -67,9 +67,6 @@ class Range:
         assert global_offset <= self.start
         return Range(self.start - global_offset, self.end - global_offset)
 
-    def __str__(self):
-        return "%d,%d [%d]" % (self.start, self.end, self.size)
-
     def __len__(self):
         return self.end - self.start
 

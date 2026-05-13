@@ -12,25 +12,21 @@ export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 export OMP_NUM_THREADS=8
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 
-CONFIG_PY=${MEGATRON_PATH}/megatron/training/set_config.py
-TP=$(python ${CONFIG_PY} tp)
-PP=$(python ${CONFIG_PY} pp)
-# export CUDA_VISIBLE_DEVICES="0"
+TP=1
+PP=1
 
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 NNODES=${NNODES:-1}
-
 NODE_RANK=${RANK:-0}
-GPUS_PER_NODE=8
+GPUS_PER_NODE=4
 WORLD_SIZE=$(($GPUS_PER_NODE*$NNODES))
 
-export ELASTIC_TRANSFER_LOG_LEVEL=$(python ${CONFIG_PY} transfer_log_level)
+export ELASTIC_TRANSFER_LOG_LEVEL=1
 
 
 # Network size variables
 export MODEL_SIZE=${MODEL_SIZE:-"tiny"}
-export MODEL_SIZE=$(python ${CONFIG_PY} model_size)
 
 if   [ ${MODEL_SIZE} == 7 ];   then HIDDEN_SIZE=4096;  NUM_HEAD=32; NUM_QUERY_GROUP=32; NUM_LAYERS=32; FFN_HIDDEN_SIZE=11008; NORM_EPS=1e-5;
 elif [ ${MODEL_SIZE} == 13 ];  then HIDDEN_SIZE=5120;  NUM_HEAD=40; NUM_QUERY_GROUP=40; NUM_LAYERS=40; FFN_HIDDEN_SIZE=13824; NORM_EPS=1e-5;
@@ -52,7 +48,7 @@ DATA_CACHE_PATH=${BASE_PATH}/data/data_cache
 TOKENIZER_PATH=${BASE_PATH}/tokenizer.model
 
 SRC_PATH=${MEGATRON_PATH}/pretrain_gpt.py
-export LOG_DIR=${LOG_DIR:-${BASE_PATH}/log-buffer-stuck}
+export LOG_DIR=${LOG_DIR:-${BASE_PATH}/log}
 mkdir -p "${LOG_DIR}"
 
 # Use a shared timestamp across nodes: prefer externally provided TIME_PREFIX.
@@ -69,7 +65,7 @@ else
   fi
 fi
 
-time_prefix=${MODEL_SIZE}B_$(python ${CONFIG_PY} log_dir)_${time_prefix}
+time_prefix=${MODEL_SIZE}B_${time_prefix}
 
 LOG_PATH=${LOG_DIR}/${time_prefix}/node_${NODE_RANK}.log
 mkdir -p ${LOG_DIR}/${time_prefix}
@@ -138,7 +134,7 @@ REGULATIZATION_ARGS=" \
 TRAINING_ARGS=" \
        --micro-batch-size ${MBS} \
        --global-batch-size ${GBS} \
-       --train-iters $(python ${CONFIG_PY} train_iters) \
+       --train-iters 20 \
        --log-interval 1 \
        --optimizer adam \
        "

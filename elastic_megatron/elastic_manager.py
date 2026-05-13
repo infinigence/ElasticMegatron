@@ -173,7 +173,8 @@ class ElasticMegatronManager:
 
 
         obj_list = [None] * torch.distributed.get_world_size(group=union_world_group)
-        torch.distributed.all_gather_object(obj_list, local_comm_info)
+        with with_world_group(union_world_group):
+            torch.distributed.all_gather_object(obj_list, local_comm_info)
 
         if self._rank == 0:
             print("-"*40+"SendRecv Info"+"-"*40)
