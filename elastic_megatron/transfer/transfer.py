@@ -483,27 +483,19 @@ class TransferManager:
                     batch.isend(packed_send_tensor, dst=peer)
         self._transfer_timers("Pack peer tensors").stop()
 
-        if batch.has_ops():
-            self._transfer_timers("Real transfer", log_level=1).start()
-            batch.wait()
-            self._transfer_timers("Real transfer").stop()
+        self._transfer_timers("Real transfer", log_level=1).start()
+        batch.wait()
+        self._transfer_timers("Real transfer").stop()
 
-            self._transfer_timers("Unpack recv tensors", log_level=1).start()
-            for packed_recv_tensor, original_recv_tensors in recv_unpack_tasks:
-                _unpack_tensors(packed_recv_tensor, original_recv_tensors)
-            self._transfer_timers("Unpack recv tensors").stop()
-            self._transfer_timers("Copy recv tensors", log_level=1).start()
-            for recv_optimizer_tensor, recv_buffer in recv_copy_back:
-                recv_optimizer_tensor.data.copy_(recv_buffer)
-            self._transfer_timers("Copy recv tensors").stop()
-        else:
-            # for timer synchronization, otherwise will get stuck
-            self._transfer_timers("Real transfer", log_level=1).start()
-            self._transfer_timers("Real transfer").stop()
-            self._transfer_timers("Unpack recv tensors", log_level=1).start()
-            self._transfer_timers("Unpack recv tensors").stop()
-            self._transfer_timers("Copy recv tensors", log_level=1).start()
-            self._transfer_timers("Copy recv tensors").stop()
+        self._transfer_timers("Unpack recv tensors", log_level=1).start()
+        for packed_recv_tensor, original_recv_tensors in recv_unpack_tasks:
+            _unpack_tensors(packed_recv_tensor, original_recv_tensors)
+        self._transfer_timers("Unpack recv tensors").stop()
+        
+        self._transfer_timers("Copy recv tensors", log_level=1).start()
+        for recv_optimizer_tensor, recv_buffer in recv_copy_back:
+            recv_optimizer_tensor.data.copy_(recv_buffer)
+        self._transfer_timers("Copy recv tensors").stop()
 
         self._transfer_timers("Release optimizer tensors", log_level=1).start()
         for src_optimizer_tensor_info in src_to_release:
