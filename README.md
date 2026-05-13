@@ -18,6 +18,36 @@ ElasticMegatron is **version-agnostic** and does not depend on a specific Megatr
 **Recommended versions**: We recommend using Megatron-LM **0.11** or **0.13** for the best compatibility and performance.
 
 ## Usage
+### Quick Start
+Follow the steps below to quickly try ElasticMegatron:
+
+1. Prepare the environment: ElasticMegatron uses the same runtime environment as Megatron-LM. For example, you can use `nvcr.io/nvidia/pytorch:24.03-py3`.
+
+2. Clone the repositories:
+
+```bash
+mkdir dynatrain && cd dynatrain
+git clone https://github.com/infinigence/ElasticMegatron.git
+git clone https://github.com/NVIDIA/Megatron-LM.git -b core_r0.11.0
+```
+
+3. Download `tokenizer.model` from `https://huggingface.co/meta-llama/Llama-2-7b/blob/main/tokenizer.model` and place it in the `dynatrain` directory.
+
+4. Import `elastic_megatron` at the beginning of `Megatron-LM/pretrain_gpt.py`:
+
+```python
+"""Pretrain GPT."""
+import elastic_megatron
+```
+
+5. Replace `Megatron-LM/megatron/training/training.py` with `ElasticMegatron/examples/intra_process/training_011.py`.
+
+6. Set `BASE_PATH` in `ElasticMegatron/run_e2e_demo.sh` to `/path/to/dynatrain`.
+
+7. Run `bash run_e2e_demo.sh`.
+
+This example trains a tiny LLaMA 2 model on a mock dataset and switches parallel strategies sequentially according to `_PARALLEL_STRATEGY_LIST` in `training.py`.
+
 ### Examples
 
 The `examples/` directory provides ready-to-use examples for both deployment modes:
