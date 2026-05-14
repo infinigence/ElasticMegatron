@@ -12,7 +12,7 @@ import elastic_megatron
 2. Add the following code segments in  `megatron/training/training.py`and modify them as needed
 * If training is conducted using Megaron 0.11, you can directly replace `megatron/training/training.py` with `exmaples/inter_process/training_011.py`.
 
-2.1 Initialize the parallel strategy. The first one is the current one (the one before resharding), and the second one is the one after resharding.
+2.1 Initialize the parallel strategy. The strategy parameters are passed through the `run_inter_process.sh` script.
 ```python
 from tools.agent.env_utils import trigger_new_node,ElasticEnv,ElasticMode
 _PARALLEL_STRATEGY_LIST = None
@@ -23,6 +23,16 @@ def init_parallel_strategy_list():
         return
   
     args = get_args()
+    env_ws = os.environ.get("ELASTIC_STRATEGY1_WORLD_SIZE")
+    env_tp = os.environ.get("ELASTIC_STRATEGY1_TP")
+    env_pp = os.environ.get("ELASTIC_STRATEGY1_PP")
+    if env_ws is not None and env_tp is not None and env_pp is not None:
+        strategy1_ws = int(env_ws)
+        strategy1_tp = int(env_tp)
+        strategy1_pp = int(env_pp)
+    else:
+        strategy1_ws, strategy1_tp, strategy1_pp = 8, 2, 4
+
     _PARALLEL_STRATEGY_LIST = [
         {
             "world_size": args.world_size,
@@ -35,12 +45,12 @@ def init_parallel_strategy_list():
             "sequence_parallel": args.sequence_parallel,
         },
         {
-            #sym:init_parallel_strategy_list
-            "world_size": 4,
-            "tensor_model_parallel_size": 2,
-            "pipeline_model_parallel_size": 1,
+            "world_size": strategy1_ws,
+            "tensor_model_parallel_size": strategy1_tp,
+            "pipeline_model_parallel_size": strategy1_pp,
         },
     ]
+
 ```
 
 2.2 Specify the time points at which resharding occur.
@@ -121,9 +131,11 @@ def pretrain(
     triggered_scale_iters = set()
     scale_up_iter = None
     scale_down_iter = None
-    # scale_action = ElasticMode.SCALE_DOWN
-    #sym:scale_action
-    scale_action = ElasticMode.SCALE_DOWN
+    _ip_mode = os.environ.get("ELASTIC_INTER_PROCESS_MODE", "").strip().lower()
+    if _ip_mode == "scale_up":
+        scale_action = ElasticMode.SCALE_UP
+    else:
+        scale_action = ElasticMode.SCALE_DOWN
 
     if not overlay_enabled:
         if (
@@ -206,7 +218,7 @@ def pretrain(
 
 
 ### 3. start training（Scale Up/Down）
-
+Update your node IP addresses in `run_inter_process.sh`.
 #### Scale Down
 ```bash
 MODE=scale_down \

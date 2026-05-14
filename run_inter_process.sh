@@ -5,13 +5,14 @@ set -euo pipefail
 MODE="${MODE:-scale_up}"
 # replace ip addr
 NODES=(
-	"10.204.3.27"
-    "10.204.30.217"
+    "<node-1-ip>"
+    "<node-2-ip>"
+    ...
 )
 
 BASE_DIR="workpath/ElasticMegatron"
 SCRIPT_DEMO="run_e2e_demo.sh"
-MASTER_PORT="${MASTER_PORT:-6368}"
+MASTER_PORT="${MASTER_PORT:-6000}"
 GPU_PER_NODE="${GPU_PER_NODE:-8}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-$GPU_PER_NODE}"
 
@@ -45,137 +46,70 @@ SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=no -o ConnectTimeout=10}"
 NNODES=${#NODES[@]}
 HALF_NODES=$((NNODES / 2))
 MASTER_ADDR=${NODES[0]}
+ELASTIC_RENDEZVOUS_MASTER_ADDR="${ELASTIC_RENDEZVOUS_MASTER_ADDR:-${RENDEZVOUS_MASTER:-$MASTER_ADDR}}"
 
-ENV_UTILS_FILE="$BASE_DIR/tools/elastic_control/env_utils.py"
-TRAINING_FILE="$BASE_DIR/Megatron-LM/megatron/training/training.py"
+export ELASTIC_INTER_PROCESS_MODE="$MODE"
 
-inject_new_node_ip_list() {
-    if [ ! -f "$ENV_UTILS_FILE" ]; then
-        echo "Warning: env_utils not found: $ENV_UTILS_FILE" >&2
-        return 0
+if [ "$MODE" = "scale_down" ]; then
+    ELASTIC_STRATEGY1_WORLD_SIZE=$((HALF_NODES * GPU_PER_NODE))
+    ELASTIC_STRATEGY1_TP="${TGT_TP}"
+    ELASTIC_STRATEGY1_PP="${TGT_PP}"
+    if [ -n "${DOWN_TGT_TP:-}" ]; then
+        ELASTIC_STRATEGY1_TP="${DOWN_TGT_TP}"
     fi
-    if ! grep -q "#sym:NEW_NODE_IP_LIST" "$ENV_UTILS_FILE"; then
-        echo "Warning: missing #sym:NEW_NODE_IP_LIST in $ENV_UTILS_FILE" >&2
-        return 0
+    if [ -n "${DOWN_TGT_PP:-}" ]; then
+        ELASTIC_STRATEGY1_PP="${DOWN_TGT_PP}"
     fi
+else
+    ELASTIC_STRATEGY1_WORLD_SIZE=$((NNODES * GPU_PER_NODE / 2))
+    ELASTIC_STRATEGY1_TP="${SRC_TP}"
+    ELASTIC_STRATEGY1_PP="${SRC_PP}"
+fi
+export ELASTIC_STRATEGY1_WORLD_SIZE ELASTIC_STRATEGY1_TP ELASTIC_STRATEGY1_PP
 
-    local entries=()
-    local j
-    for (( j=HALF_NODES; j<NNODES; j++ )); do
-        local node_ip=${NODES[$j]}
-        entries+=("[\"$node_ip\", 23455, 1]")
-    done
-    local literal="[$(IFS=,; echo "${entries[*]}")]"
-    local escaped_literal
-    escaped_literal="$(printf '%s' "$literal" | sed 's/[&|]/\\&/g')"
-    sed -i "/#sym:NEW_NODE_IP_LIST/{n;s|^[[:space:]]*NEW_NODE_IP_LIST = .*|    NEW_NODE_IP_LIST = ${escaped_literal}|;}" "$ENV_UTILS_FILE"
-    echo "Injected #sym:NEW_NODE_IP_LIST into $ENV_UTILS_FILE: $literal"
-}
+entries=()
+for (( j=HALF_NODES; j<NNODES; j++ )); do
+    node_ip="${NODES[$j]}"
+    entries+=("[\"${node_ip}\",23455,1]")
+done
+ELASTIC_NEW_NODE_IP_LIST="[$(IFS=,; echo "${entries[*]}")]"
+export ELASTIC_NEW_NODE_IP_LIST
 
-inject_deleted_node_rank() {
-    if [ ! -f "$ENV_UTILS_FILE" ]; then
-        echo "Warning: env_utils not found: $ENV_UTILS_FILE" >&2
-        return 0
-    fi
-    if ! grep -q "#sym:set_deleted_node_rank" "$ENV_UTILS_FILE"; then
-        echo "Warning: missing #sym:set_deleted_node_rank in $ENV_UTILS_FILE" >&2
-        return 0
-    fi
-
-    local deleted=()
-    local node_idx local_rank global_rank
+ELASTIC_DELETED_RANKS=""
+if [ "$MODE" = "scale_down" ]; then
     for ((node_idx=HALF_NODES; node_idx<NNODES; node_idx++)); do
         for ((local_rank=0; local_rank<GPU_PER_NODE; local_rank++)); do
             global_rank=$((node_idx * GPU_PER_NODE + local_rank))
-            deleted+=("$global_rank")
+            if [ -n "$ELASTIC_DELETED_RANKS" ]; then
+                ELASTIC_DELETED_RANKS+=","
+            fi
+            ELASTIC_DELETED_RANKS+="$global_rank"
         done
     done
+fi
+export ELASTIC_DELETED_RANKS
 
-    local deleted_literal="[$(IFS=,; echo "${deleted[*]}")]"
-    local escaped_deleted
-    escaped_deleted="$(printf '%s' "$deleted_literal" | sed 's/[&|]/\\&/g')"
-    sed -i "/#sym:set_deleted_node_rank/{n;s|^[[:space:]]*_DELETED_NODE_RANK = .*|    _DELETED_NODE_RANK = ${escaped_deleted}|;}" "$ENV_UTILS_FILE"
-    echo "Injected #sym:set_deleted_node_rank: $deleted_literal"
-}
-
-inject_scale_action() {
-    if [ ! -f "$TRAINING_FILE" ]; then
-        echo "Warning: training file not found: $TRAINING_FILE" >&2
-        return 0
-    fi
-    if ! grep -q "#sym:scale_action" "$TRAINING_FILE"; then
-        echo "Warning: missing #sym:scale_action in $TRAINING_FILE" >&2
-        return 0
-    fi
-    if [ "$MODE" = "scale_down" ]; then
-        sed -i "/#sym:scale_action/{n;s|^[[:space:]]*scale_action = .*|    scale_action = ElasticMode.SCALE_DOWN|;}" "$TRAINING_FILE"
-        echo "Injected #sym:scale_action as SCALE_DOWN"
-    else
-        sed -i "/#sym:scale_action/{n;s|^[[:space:]]*scale_action = .*|    scale_action = ElasticMode.SCALE_UP|;}" "$TRAINING_FILE"
-        echo "Injected #sym:scale_action as SCALE_UP"
-    fi
-}
-
-inject_parallel_strategy() {
-    if [ ! -f "$TRAINING_FILE" ]; then
-        echo "Warning: training file not found: $TRAINING_FILE" >&2
-        return 0
-    fi
-    if ! grep -q "#sym:init_parallel_strategy_list" "$TRAINING_FILE"; then
-        echo "Warning: missing #sym:init_parallel_strategy_list in $TRAINING_FILE" >&2
-        return 0
-    fi
-
-    if [ "$MODE" = "scale_down" ]; then
-        local tgt_world_size=$((HALF_NODES * GPU_PER_NODE))
-        local eff_tgt_tp="${TGT_TP}"
-        local eff_tgt_pp="${TGT_PP}"
-        if [ -n "${DOWN_TGT_TP}" ]; then
-            eff_tgt_tp="${DOWN_TGT_TP}"
-        fi
-        if [ -n "${DOWN_TGT_PP}" ]; then
-            eff_tgt_pp="${DOWN_TGT_PP}"
-        fi
-        sed -i "/#sym:init_parallel_strategy_list/{n;s|^[[:space:]]*\"world_size\": .*|            \"world_size\": ${tgt_world_size},|;n;s|^[[:space:]]*\"tensor_model_parallel_size\": .*|            \"tensor_model_parallel_size\": ${eff_tgt_tp},|;n;s|^[[:space:]]*\"pipeline_model_parallel_size\": .*|            \"pipeline_model_parallel_size\": ${eff_tgt_pp},|;}" "$TRAINING_FILE"
-        echo "Injected #sym:init_parallel_strategy_list world_size=$tgt_world_size tp=$eff_tgt_tp pp=$eff_tgt_pp"
-    else
-        local tgt_world_size=$((NNODES * GPU_PER_NODE / 2))
-        sed -i "/#sym:init_parallel_strategy_list/{n;s|^[[:space:]]*\"world_size\": .*|            \"world_size\": ${tgt_world_size},|;n;s|^[[:space:]]*\"tensor_model_parallel_size\": .*|            \"tensor_model_parallel_size\": ${SRC_TP},|;n;s|^[[:space:]]*\"pipeline_model_parallel_size\": .*|            \"pipeline_model_parallel_size\": ${SRC_PP},|;}" "$TRAINING_FILE"
-        echo "Injected #sym:init_parallel_strategy_list world_size=$tgt_world_size tp=$SRC_TP pp=$SRC_PP"
-    fi
-}
-
-inject_elastic_target_env() {
-    if [ ! -f "$ENV_UTILS_FILE" ]; then
-        echo "Warning: env_utils not found: $ENV_UTILS_FILE" >&2
-        return 0
-    fi
-    if ! grep -q "#sym:elastic_target_env" "$ENV_UTILS_FILE"; then
-        echo "Warning: missing #sym:elastic_target_env in $ENV_UTILS_FILE" >&2
-        return 0
-    fi
-    if [ "$MODE" = "scale_up" ]; then
-        local tgt_nnodes="${TGT_NNODES:-$NNODES}"
-        sed -i "/#sym:elastic_target_env/{n;s|^[[:space:]]*new_env\\[\"NNODES\"\\] = .*|        new_env[\"NNODES\"] = \"${tgt_nnodes}\"|;n;s|^[[:space:]]*new_env\\[\"PP\"\\] = .*|        new_env[\"PP\"] = \"${TGT_PP}\"|;n;s|^[[:space:]]*new_env\\[\"TP\"\\] = .*|        new_env[\"TP\"] = \"${TGT_TP}\"|;}" "$ENV_UTILS_FILE"
-        echo "Injected #sym:elastic_target_env NNODES=$tgt_nnodes PP=$TGT_PP TP=$TGT_TP"
-    fi
-}
+elastic_exports="export ELASTIC_INTER_PROCESS_MODE=$(printf %q "$ELASTIC_INTER_PROCESS_MODE")"
+elastic_exports="$elastic_exports && export ELASTIC_STRATEGY1_WORLD_SIZE=$ELASTIC_STRATEGY1_WORLD_SIZE"
+elastic_exports="$elastic_exports && export ELASTIC_STRATEGY1_TP=$(printf %q "$ELASTIC_STRATEGY1_TP")"
+elastic_exports="$elastic_exports && export ELASTIC_STRATEGY1_PP=$(printf %q "$ELASTIC_STRATEGY1_PP")"
+elastic_exports="$elastic_exports && export ELASTIC_NEW_NODE_IP_LIST=$(printf %q "$ELASTIC_NEW_NODE_IP_LIST")"
+elastic_exports="$elastic_exports && export ELASTIC_DELETED_RANKS=$(printf %q "$ELASTIC_DELETED_RANKS")"
+elastic_exports="$elastic_exports && export ELASTIC_RENDEZVOUS_MASTER_ADDR=$(printf %q "$ELASTIC_RENDEZVOUS_MASTER_ADDR")"
 
 echo "MODE: $MODE"
 echo "Total nodes: $NNODES"
-echo "Half nodes split index: $HALF_NODES"
 echo "Master addr: $MASTER_ADDR"
-echo "Master port (old group): $MASTER_PORT"
+echo "ELASTIC_RENDEZVOUS_MASTER_ADDR: $ELASTIC_RENDEZVOUS_MASTER_ADDR"
+echo "Master port: $MASTER_PORT"
 echo "GPUS per node: $GPUS_PER_NODE"
 echo "Trigger iters: ELASTIC_SCALE_UP_ITER=$SCALE_UP_ITER ELASTIC_SCALE_DOWN_ITER=$SCALE_DOWN_ITER"
-
-inject_new_node_ip_list
+echo "Elastic env: ELASTIC_WORLD_SIZE=$ELASTIC_STRATEGY1_WORLD_SIZE TP=$ELASTIC_STRATEGY1_TP PP=$ELASTIC_STRATEGY1_PP"
 if [ "$MODE" = "scale_down" ]; then
-    inject_deleted_node_rank
+    echo "Scale-down initial torchrun TP=$SRC_TP PP=$SRC_PP"
 fi
-inject_scale_action
-inject_parallel_strategy
-inject_elastic_target_env
+echo "ELASTIC_NEW_NODE_IP_LIST=$ELASTIC_NEW_NODE_IP_LIST"
+echo "ELASTIC_DELETED_RANKS=$ELASTIC_DELETED_RANKS"
 
 for (( i=0; i<NNODES; i++ )); do
     NODE=${NODES[$i]}
@@ -184,12 +118,12 @@ for (( i=0; i<NNODES; i++ )); do
     echo "Launching on $NODE with RANK=$RANK..."
 
     base_exports="export RANK=$RANK && export NODE_RANK=$RANK && export MASTER_ADDR=$MASTER_ADDR && export MASTER_PORT=$MASTER_PORT && export GPUS_PER_NODE=$GPUS_PER_NODE && export NNODES=$NNODES && export ELASTIC_SCALE_UP_ITER=$SCALE_UP_ITER && export ELASTIC_SCALE_DOWN_ITER=$SCALE_DOWN_ITER"
+    base_exports="$base_exports && $elastic_exports"
 
     if [ "$MODE" = "scale_up" ] && [ $i -lt $HALF_NODES ]; then
-        # old group only; new nodes will be launched by rank0 via ssh later.
         base_exports="$base_exports && export TP=$SRC_TP && export PP=$SRC_PP && export NNODES=$HALF_NODES && export ELASTIC_TARGET_NNODES=${TGT_NNODES:-$NNODES} && export ELASTIC_TARGET_TP=$TGT_TP && export ELASTIC_TARGET_PP=$TGT_PP"
     elif [ "$MODE" = "scale_down" ]; then
-        base_exports="$base_exports && export ELASTIC_TARGET_NNODES=$HALF_NODES"
+        base_exports="$base_exports && export TP=$SRC_TP && export PP=$SRC_PP && export ELASTIC_TARGET_NNODES=$HALF_NODES"
     else
         if [ "$MODE" = "scale_up" ]; then
             echo "  -> Role: Reserved for SSH scale-up launch"

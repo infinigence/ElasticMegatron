@@ -141,6 +141,16 @@ def init_parallel_strategy_list():
         return
   
     args = get_args()
+    env_ws = os.environ.get("ELASTIC_STRATEGY1_WORLD_SIZE")
+    env_tp = os.environ.get("ELASTIC_STRATEGY1_TP")
+    env_pp = os.environ.get("ELASTIC_STRATEGY1_PP")
+    if env_ws is not None and env_tp is not None and env_pp is not None:
+        strategy1_ws = int(env_ws)
+        strategy1_tp = int(env_tp)
+        strategy1_pp = int(env_pp)
+    else:
+        strategy1_ws, strategy1_tp, strategy1_pp = 8, 2, 4
+
     _PARALLEL_STRATEGY_LIST = [
         {
             "world_size": args.world_size,
@@ -153,10 +163,9 @@ def init_parallel_strategy_list():
             "sequence_parallel": args.sequence_parallel,
         },
         {
-            #sym:init_parallel_strategy_list
-            "world_size": 8,
-            "tensor_model_parallel_size": 2,
-            "pipeline_model_parallel_size": 4,
+            "world_size": strategy1_ws,
+            "tensor_model_parallel_size": strategy1_tp,
+            "pipeline_model_parallel_size": strategy1_pp,
         },
     ]
 
@@ -1568,9 +1577,11 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     triggered_scale_iters = set()
     scale_up_iter = None
     scale_down_iter = None
-    # scale_action = ElasticMode.SCALE_DOWN
-    #sym:scale_action
-    scale_action = ElasticMode.SCALE_DOWN
+    _ip_mode = os.environ.get("ELASTIC_INTER_PROCESS_MODE", "").strip().lower()
+    if _ip_mode == "scale_up":
+        scale_action = ElasticMode.SCALE_UP
+    else:
+        scale_action = ElasticMode.SCALE_DOWN
 
     if not overlay_enabled:
         if (

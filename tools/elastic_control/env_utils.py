@@ -1,3 +1,4 @@
+import json
 import os
 import torch
 import socket
@@ -49,21 +50,53 @@ def get_deleted_node_rank():
     return _DELETED_NODE_RANK
 
 
+def _parse_deleted_ranks_from_env():
+    raw = os.environ.get("ELASTIC_DELETED_RANKS", "").strip()
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    return out
+
+
+def _parse_new_node_ip_list_from_env():
+    raw = os.environ.get("ELASTIC_NEW_NODE_IP_LIST", "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return data
+
+
 def set_deleted_node_rank():
     global _DELETED_NODE_RANK
-    #sym:set_deleted_node_rank
-    _DELETED_NODE_RANK = [8,9,10,11,12,13,14,15]
-    # _DELETED_NODE_RANK = [2,3]
+    _DELETED_NODE_RANK = _parse_deleted_ranks_from_env()
 
 
 def set_new_node_ip_list():
     global NEW_NODE_IP_LIST
-    #sym:set_new_node_ip_list
-    #sym:NEW_NODE_IP_LIST
-    NEW_NODE_IP_LIST = [["10.204.30.217", 23455, 1]]
+    parsed = _parse_new_node_ip_list_from_env()
+    NEW_NODE_IP_LIST = parsed if parsed is not None else []
+
 
 set_new_node_ip_list()
 set_deleted_node_rank()
+
+
+def _get_rdzv_master():
+    """Torchrun rendezvous host from env"""
+    for key in ("ELASTIC_RENDEZVOUS_MASTER_ADDR", "MASTER_ADDR"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return val
+    return None
 
 
 def get_shm_handle():
@@ -145,14 +178,16 @@ def trigger_new_node():
         "ELASTIC_SCALEUP_VENV_ACTIVATE",
         os.environ.get("VENV_ACTIVATE", "/opt/venv/reason/bin/activate"),
     )
-    master_addr = os.environ.get("MASTER_ADDR")
+    master_addr = _get_rdzv_master()
+    if not master_addr:
+        raise RuntimeError(
+            "scale-up SSH requires ELASTIC_RENDEZVOUS_MASTER_ADDR or MASTER_ADDR in the "
+            "training process environment (bash-only defaults in run_e2e_demo.sh are not visible here)."
+        )
     master_port = str(int(os.environ.get("MASTER_PORT", "6368")) + 1)
     nnodes = os.environ.get("ELASTIC_TARGET_NNODES", os.environ.get("NNODES", "2"))
     tp = os.environ.get("ELASTIC_TARGET_TP", os.environ.get("TP", "2"))
     pp = os.environ.get("ELASTIC_TARGET_PP", os.environ.get("PP", "8"))
-
-    if not master_addr:
-        raise RuntimeError("MASTER_ADDR is required for scale-up ssh launch")
 
     for idx, (node_addr, _node_port, node_rank) in enumerate(nodes_info):
         remote_target = f"{ssh_user}@{node_addr}" if ssh_user else str(node_addr)
@@ -171,8 +206,11 @@ def trigger_new_node():
             f"export RANK={int(node_rank)}",
         ]
         for key, value in os.environ.items():
-            if key.startswith("ELASTIC_"):
+            if key.startswith("ELASTIC_") and key != "ELASTIC_RENDEZVOUS_MASTER_ADDR":
                 remote_exports.append(f"export {key}={shlex.quote(str(value))}")
+        remote_exports.append(
+            f"export ELASTIC_RENDEZVOUS_MASTER_ADDR={shlex.quote(str(master_addr))}"
+        )
 
         remote_cmd = (
             "bash -lc "
@@ -432,6 +470,12 @@ def _start_new_megatron_proc(scale_action, redeploy_script_path=None, node1_ip=N
 
         gpus_per_node = int(os.environ.get("GPUS_PER_NODE", "8"))
         node_rank = int(os.environ.get("RANK", "0")) // gpus_per_node
+        parallel_strategy_list = get_parallel_strategy_list()
+        cur_strategy = parallel_strategy_list[0]
+        tgt_strategy = parallel_strategy_list[1]
+
+        new_env["TP"] = str(cur_strategy["tensor_model_parallel_size"])
+        new_env["PP"] = str(cur_strategy["pipeline_model_parallel_size"])
 
         new_env["NEW_PROCESS_SCALE_DOWN_SENDER"] = "1"
         new_env["GPUS_PER_NODE"] = str(gpus_per_node)
@@ -460,12 +504,8 @@ def _start_new_megatron_proc(scale_action, redeploy_script_path=None, node1_ip=N
             )
 
             new_env_proc_2["NNODES"] = str(os.environ.get("ELASTIC_TARGET_NNODES"))
-            new_env_proc_2["PP"] = str(
-                get_parallel_strategy_list()[1]["pipeline_model_parallel_size"]
-            )
-            new_env_proc_2["TP"] = str(
-                get_parallel_strategy_list()[1]["tensor_model_parallel_size"]
-            )
+            new_env_proc_2["PP"] = str(tgt_strategy["pipeline_model_parallel_size"])
+            new_env_proc_2["TP"] = str(tgt_strategy["tensor_model_parallel_size"])
             p = Process(
                 target=_exec_wrapper,
                 args=("bash", ["bash", "run_e2e_demo.sh"], new_env_proc_2, log_path),
@@ -479,11 +519,19 @@ def _start_new_megatron_proc(scale_action, redeploy_script_path=None, node1_ip=N
         
 
         new_env["MASTER_PORT"] = str(int(os.environ.get("MASTER_PORT")) + 1)
-        
-        #sym:elastic_target_env
-        new_env["NNODES"] = "2"
-        new_env["PP"] = "8"
-        new_env["TP"] = "2"
+        _rdzv = _get_rdzv_master()
+        if _rdzv:
+            new_env["MASTER_ADDR"] = _rdzv
+            new_env["ELASTIC_RENDEZVOUS_MASTER_ADDR"] = _rdzv
+
+        nnodes = os.environ.get(
+            "ELASTIC_TARGET_NNODES", os.environ.get("NNODES", "2")
+        )
+        pp = os.environ.get("ELASTIC_TARGET_PP", os.environ.get("PP", "8"))
+        tp = os.environ.get("ELASTIC_TARGET_TP", os.environ.get("TP", "2"))
+        new_env["NNODES"] = str(nnodes)
+        new_env["PP"] = str(pp)
+        new_env["TP"] = str(tp)
         p = Process(
             target=_exec_wrapper,
             args=("bash", ["bash", "run_e2e_demo.sh"], new_env, log_path),
