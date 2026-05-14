@@ -39,7 +39,7 @@ else
     TGT_TP="${UP_TGT_TP:-${TGT_TP:-2}}"
 fi
 
-VENV_ACTIVATE="${VENV_ACTIVATE:-/opt/venv/reason/bin/activate}"
+VENV_ACTIVATE="${VENV_ACTIVATE:-/path/to/your/venv/bin/activate}"
 SSH_USER="${SSH_USER:-}"
 SSH_OPTS="${SSH_OPTS:--o StrictHostKeyChecking=no -o ConnectTimeout=10}"
 
