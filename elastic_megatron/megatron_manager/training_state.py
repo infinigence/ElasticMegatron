@@ -9,7 +9,6 @@ from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from typing import List, Callable, Dict, Optional
 
 from megatron.training.checkpointing import save_checkpoint
-from megatron.training.training import preprocess_common_state_dict
 import os
 import pathlib
 
@@ -326,10 +325,13 @@ class TrainingState:
         self,
         iteration: Optional[int] = None,
         num_floating_point_operations_so_far: Optional[float] = None,
-        preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        preprocess_common_state_dict_fn=None,
         is_before_reshard: bool = True,
         save_path: Optional[str] = None,
     ):
+        if preprocess_common_state_dict_fn is None:
+            from megatron.training.training import preprocess_common_state_dict as preprocess_common_state_dict_fn
+
         args = get_args()
         if iteration is None:
             iteration = getattr(args, "curr_iteration", 0) + 1
