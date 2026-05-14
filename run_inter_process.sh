@@ -13,8 +13,7 @@ NODES=(
 BASE_DIR="workpath/ElasticMegatron"
 SCRIPT_DEMO="run_e2e_demo.sh"
 MASTER_PORT="${MASTER_PORT:-6000}"
-GPU_PER_NODE="${GPU_PER_NODE:-8}"
-GPUS_PER_NODE="${GPUS_PER_NODE:-$GPU_PER_NODE}"
+GPUS_PER_NODE="${GPUS_PER_NODE:-8}"
 
 
 SCALE_UP_ITER="${SCALE_UP_ITER:-999}"
@@ -51,7 +50,7 @@ ELASTIC_RENDEZVOUS_MASTER_ADDR="${ELASTIC_RENDEZVOUS_MASTER_ADDR:-${RENDEZVOUS_M
 export ELASTIC_INTER_PROCESS_MODE="$MODE"
 
 if [ "$MODE" = "scale_down" ]; then
-    ELASTIC_STRATEGY1_WORLD_SIZE=$((HALF_NODES * GPU_PER_NODE))
+    ELASTIC_STRATEGY1_WORLD_SIZE=$((HALF_NODES * GPUS_PER_NODE))
     ELASTIC_STRATEGY1_TP="${TGT_TP}"
     ELASTIC_STRATEGY1_PP="${TGT_PP}"
     if [ -n "${DOWN_TGT_TP:-}" ]; then
@@ -61,7 +60,7 @@ if [ "$MODE" = "scale_down" ]; then
         ELASTIC_STRATEGY1_PP="${DOWN_TGT_PP}"
     fi
 else
-    ELASTIC_STRATEGY1_WORLD_SIZE=$((NNODES * GPU_PER_NODE / 2))
+    ELASTIC_STRATEGY1_WORLD_SIZE=$((NNODES * GPUS_PER_NODE / 2))
     ELASTIC_STRATEGY1_TP="${SRC_TP}"
     ELASTIC_STRATEGY1_PP="${SRC_PP}"
 fi
@@ -78,8 +77,8 @@ export ELASTIC_NEW_NODE_IP_LIST
 ELASTIC_DELETED_RANKS=""
 if [ "$MODE" = "scale_down" ]; then
     for ((node_idx=HALF_NODES; node_idx<NNODES; node_idx++)); do
-        for ((local_rank=0; local_rank<GPU_PER_NODE; local_rank++)); do
-            global_rank=$((node_idx * GPU_PER_NODE + local_rank))
+        for ((local_rank=0; local_rank<GPUS_PER_NODE; local_rank++)); do
+            global_rank=$((node_idx * GPUS_PER_NODE + local_rank))
             if [ -n "$ELASTIC_DELETED_RANKS" ]; then
                 ELASTIC_DELETED_RANKS+=","
             fi

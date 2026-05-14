@@ -176,7 +176,7 @@ def trigger_new_node():
     workdir = str(Path(__file__).resolve().parents[2])
     venv_activate = os.environ.get(
         "ELASTIC_SCALEUP_VENV_ACTIVATE",
-        os.environ.get("VENV_ACTIVATE", "/opt/venv/reason/bin/activate"),
+        os.environ.get("VENV_ACTIVATE", "/path/to/your/venv/bin/activate"),
     )
     master_addr = _get_rdzv_master()
     if not master_addr:
