@@ -1,6 +1,6 @@
-from megatron.core.parallel_state import RankGenerator
-
 from typing import TYPE_CHECKING
+
+from megatron.core.parallel_state import RankGenerator
 
 if TYPE_CHECKING:
     from .parallel_strategy import ParallelStrategy
@@ -49,4 +49,3 @@ class ElasticRankGenerator:
 
         for x in d_ranks:
             yield x
-        return

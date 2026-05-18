@@ -1,15 +1,15 @@
-from typing import Dict, List
 from contextlib import contextmanager
-import torch
-from .mpu_state import MPUState, get_union_world_group
-from .training_state import TrainingState
-from .parallel_strategy import ParallelStrategy
 
-from megatron.training.global_vars import get_args
-from megatron.core.optimizer import MegatronOptimizer
+import torch
 from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.training.global_vars import get_args
+
 from ..distributed import ElasticProcessGroup
+from .mpu_state import MPUState, get_union_world_group
+from .parallel_strategy import ParallelStrategy
+from .training_state import TrainingState
 
 WORLD_GROUP = None
 
@@ -43,12 +43,12 @@ class MegatronState:
         )
         args = get_args()
         set_world_group(self.mpu_state.world_group)
-        self.mpu_state.initialize_model_parallel(
-            skip_initialize_mpu,
-            args.tensor_model_parallel_size,
-            args.pipeline_model_parallel_size,
-            args.virtual_pipeline_model_parallel_size,
-            args.pipeline_model_parallel_split_rank,
+        from ..resharding.util import get_megatron_version_minor
+
+        init_kwargs = dict(
+            tensor_model_parallel_size=args.tensor_model_parallel_size,
+            pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+            virtual_pipeline_model_parallel_size=args.virtual_pipeline_model_parallel_size,
             context_parallel_size=args.context_parallel_size,
             hierarchical_context_parallel_sizes=getattr(
                 args, "hierarchical_context_parallel_sizes", None
@@ -66,13 +66,21 @@ class MegatronState:
             if not args.use_tp_pp_dp_mapping
             else "tp-cp-ep-pp-dp",
         )
+        # pipeline_model_parallel_split_rank was removed from
+        # initialize_model_parallel() in Megatron 0.16; keep it only on older versions.
+        if get_megatron_version_minor() < 16:
+            init_kwargs["pipeline_model_parallel_split_rank"] = getattr(
+                args, "pipeline_model_parallel_split_rank", None
+            )
+
+        self.mpu_state.initialize_model_parallel(skip_initialize_mpu, **init_kwargs)
 
         self.parallel_strategy.register_mpu_state()
         self.training_state = None
 
     def init_training_state(
         self,
-        model: List[DDP],
+        model: list[DDP],
         optimizer: MegatronOptimizer,
         opt_param_scheduler: OptimizerParamScheduler,
         offload_opt_tensors: bool,
@@ -94,8 +102,8 @@ class MegatronState:
 class MegatronStateManager:
     def __init__(self):
         self.current_megatron_state: MegatronState = None
-        self._parallel_strategy_to_megatron_state: Dict[str, MegatronState] = {}
-        self._state_id_to_parallel_strategy: Dict[int, str] = {}
+        self._parallel_strategy_to_megatron_state: dict[str, MegatronState] = {}
+        self._state_id_to_parallel_strategy: dict[int, str] = {}
         self._state_id: int = -1
 
         self.specified_world_group: ElasticProcessGroup = None
@@ -115,7 +123,7 @@ class MegatronStateManager:
             parallel_strategy_str
         ]
 
-    def init_parallel_strategy_list(self, parallel_strategy_list: List[Dict[str, int]]):
+    def init_parallel_strategy_list(self, parallel_strategy_list: list[dict[str, int]]):
         for i, parallel_strategy_dict in enumerate(parallel_strategy_list):
             parallel_strategy = ParallelStrategy(**parallel_strategy_dict)
             if i == 0:
@@ -126,7 +134,7 @@ class MegatronStateManager:
 
     def init_training_state(
         self,
-        model: List[DDP],
+        model: list[DDP],
         optimizer: MegatronOptimizer,
         opt_param_scheduler: OptimizerParamScheduler,
         offload_opt_tensors: bool,
@@ -157,7 +165,7 @@ class MegatronStateManager:
 
     def reshard(
         self,
-        new_parallel_strategy: ParallelStrategy | Dict[str, int],
+        new_parallel_strategy: ParallelStrategy | dict[str, int],
         is_meta_device: bool,
     ) -> tuple[MegatronState, MegatronState, ElasticProcessGroup]:
         if not isinstance(new_parallel_strategy, ParallelStrategy):
@@ -212,7 +220,7 @@ class MegatronStateManager:
         return src_megatron_state, dst_megatron_state, union_world_group
 
     def get_data_parallel_group(
-        self, parallel_strategy: ParallelStrategy | Dict[str, int]
+        self, parallel_strategy: ParallelStrategy | dict[str, int]
     ) -> ElasticProcessGroup:
         if not isinstance(parallel_strategy, ParallelStrategy):
             parallel_strategy = ParallelStrategy(**parallel_strategy)

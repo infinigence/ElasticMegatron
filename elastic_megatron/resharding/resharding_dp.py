@@ -1,18 +1,17 @@
-from typing import Any, TYPE_CHECKING
 from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
+
 import torch
-from megatron.training.global_vars import get_args
-from megatron.core.distributed.param_and_grad_buffer import (
-    _ParamAndGradBuffer,
-    _ParamAndGradBucket,
-)
 from megatron.core import parallel_state
+from megatron.core.distributed.param_and_grad_buffer import (
+    _ParamAndGradBucket,
+    _ParamAndGradBuffer,
+)
+from megatron.training.global_vars import get_args
 
 from ..megatron_manager.parallel_strategy import ParallelStrategy
-
-from .util import Range, get_megatron_version_minor
-
 from .resharding_pp import PipelineParallelReshardingInfo
+from .util import Range, get_megatron_version_minor
 
 if TYPE_CHECKING:
     from .virtual_param import VirtualParam
@@ -51,21 +50,21 @@ class DataParallelReshardingInfo:
         src_parallel_strategy: ParallelStrategy,
         dst_parallel_strategy: ParallelStrategy,
         pipeline_parallel_resharding_info: PipelineParallelReshardingInfo,
-        expert_parallel_reshardign_info: ExpertParallelReshardingInfo,
+        expert_parallel_resharding_info: ExpertParallelReshardingInfo,
     ):
         self.src_dp_distribution = src_dp_distribution
         self.dst_dp_distribution = dst_dp_distribution
 
         self.src_pp_rank = pipeline_parallel_resharding_info.src_pp_rank
         self.dst_pp_rank = pipeline_parallel_resharding_info.dst_pp_rank
-        self.is_expert = expert_parallel_reshardign_info is not None
+        self.is_expert = expert_parallel_resharding_info is not None
         self.src_ep_rank = (
-            expert_parallel_reshardign_info.src_expert_parallel_rank
+            expert_parallel_resharding_info.src_expert_parallel_rank
             if self.is_expert
             else None
         )
         self.dst_ep_rank = (
-            expert_parallel_reshardign_info.dst_expert_parallel_rank
+            expert_parallel_resharding_info.dst_expert_parallel_rank
             if self.is_expert
             else None
         )
@@ -97,14 +96,30 @@ class DataParallelReshardingInfo:
             if not parallel_strategy.is_running:
                 return dp_distribution_with_global_rank
 
-            tp_rank = parallel_strategy.get_tensor_model_parallel_rank(self.is_expert)
+            # When EP=1, Megatron treats experts as dense (allreduce=True), so
+            # the rank layout uses the dense (tp, dp) grid. Pass dense tp_rank
+            # and ep_rank=None so get_global_rank takes the dense code path.
+            expert_as_dense = (
+                self.is_expert and parallel_strategy.expert_is_dense_bucketed()
+            )
+
+            if expert_as_dense:
+                tp_rank_for_gr = parallel_strategy.get_tensor_model_parallel_rank(
+                    is_expert=False
+                )
+                ep_rank_for_gr = None
+            else:
+                tp_rank_for_gr = parallel_strategy.get_tensor_model_parallel_rank(
+                    self.is_expert
+                )
+                ep_rank_for_gr = ep_rank
 
             for dp_rank, param_range in dp_distribution.items():
                 global_rank = get_global_rank(
                     pipeline_model_parallel_rank=pp_rank,
                     data_parallel_rank=dp_rank,
-                    expert_model_parallel_rank=ep_rank,
-                    tensor_model_parallel_rank=tp_rank,
+                    expert_model_parallel_rank=ep_rank_for_gr,
+                    tensor_model_parallel_rank=tp_rank_for_gr,
                     parallel_strategy=parallel_strategy,
                 )
                 dp_distribution_with_global_rank[global_rank] = param_range
@@ -118,19 +133,21 @@ class DataParallelReshardingInfo:
         )
 
     def _init_aligned_rank(self):
-        self.src_aligned_dp_rank = list(self.src_dp_distribution.keys())[0]
-        self.dst_aligned_dp_rank = list(self.dst_dp_distribution.keys())[0]
+        assert self.src_dp_distribution, "src_dp_distribution must not be empty"
+        assert self.dst_dp_distribution, "dst_dp_distribution must not be empty"
+        self.src_aligned_dp_rank = next(iter(self.src_dp_distribution.keys()))
+        self.dst_aligned_dp_rank = next(iter(self.dst_dp_distribution.keys()))
 
         self.src_aligned_global_rank = None
         self.dst_aligned_global_rank = None
         if self.src_dp_distribution_with_global_rank:
-            self.src_aligned_global_rank = list(
-                self.src_dp_distribution_with_global_rank.keys()
-            )[0]
+            self.src_aligned_global_rank = next(
+                iter(self.src_dp_distribution_with_global_rank.keys())
+            )
         if self.dst_dp_distribution_with_global_rank:
-            self.dst_aligned_global_rank = list(
-                self.dst_dp_distribution_with_global_rank.keys()
-            )[0]
+            self.dst_aligned_global_rank = next(
+                iter(self.dst_dp_distribution_with_global_rank.keys())
+            )
 
 
 def intersect_range(main_range: Range, sub_range: Range) -> Range:
@@ -160,6 +177,10 @@ def mock_ddp_buffer_init(data_parallel_size: int):
     origin_torch_zeros = torch.zeros
 
     class _FakeTensor:
+        # Placeholder tensor that only implements the attribute surface accessed by
+        # _ParamAndGradBuffer.__init__. The __getattr__ trip-wire turns any new
+        # access introduced by a future Megatron version into a loud error rather
+        # than a silent AttributeError swallowed by try/finally.
         def __init__(
             self,
             shape,
@@ -171,7 +192,7 @@ def mock_ddp_buffer_init(data_parallel_size: int):
             if hasattr(shape, "numel"):
                 self._numel = int(shape.numel())
             elif hasattr(shape, "size"):
-                self._numel = int(getattr(shape, "size"))
+                self._numel = int(shape.size)
             else:
                 self._numel = int(shape)
             self.dtype = dtype
@@ -190,6 +211,14 @@ def mock_ddp_buffer_init(data_parallel_size: int):
 
         def copy_(self, src):
             return self
+
+        def __getattr__(self, name):
+            # __getattr__ 只在常规属性查找失败时调用,不影响赋值。
+            raise NotImplementedError(
+                f"_FakeTensor.{name!r} not implemented. mock_ddp_buffer_init 只 mock 了 "
+                f"mcore 0.16 实际会访问的方法/属性集合;若 0.17+ 的 _ParamAndGradBuffer "
+                f"在 init 路径新增了对其它属性的访问,请补全 _FakeTensor。"
+            )
 
     def mock_torch_zeros(size, *args, **kwargs):
         return _FakeTensor(
@@ -236,6 +265,13 @@ def get_ddp_buffer_distribution(
         def size(self) -> int:
             return self._size
 
+        def rank(self) -> int:
+            # Reshard planning always runs from the caller's perspective, so we
+            # pretend to be rank 0 of every group we fake. The `_get` / bucket
+            # construction path is patched out separately, so this rank value
+            # only influences log_on_each_pipeline_stage().
+            return 0
+
     kwargs = {
         "ddp_config": ddp_config,
         "param_dtype": "param_dtype",
@@ -250,6 +286,17 @@ def get_ddp_buffer_distribution(
 
     if get_megatron_version_minor() >= 13:
         kwargs["nccl_ub"] = False
+    if get_megatron_version_minor() >= 16:
+        # 0.16 switched _ParamAndGradBuffer to a pg_collection-based ctor.
+        # The only attributes touched on the fake TP / DP+CP groups are
+        # `rank()` (via log_on_each_pipeline_stage); their `size()` is never
+        # queried since `_get` and bucket finalisation are mocked out, so the
+        # group sizes here are placeholders.
+        class _FakePgCollection:
+            tp = _MockProcessGroup(1)
+            dp_cp = _MockProcessGroup(data_parallel_size)
+
+        kwargs["pg_collection"] = _FakePgCollection()
 
     with mock_ddp_buffer_init(data_parallel_size):
         ddp_buffer = _ParamAndGradBuffer(**kwargs)
@@ -264,12 +311,12 @@ def get_ddp_buffer_distribution(
     ) -> list[dict["VirtualParam", Range]]:
         bucket_start_index, bucket_end_index = bucket_indices[bucket.bucket_id]
         bucket_numel = bucket_end_index - bucket_start_index
-        bucket_params: list["VirtualParam"] = bucket.params_list
+        bucket_params: list[VirtualParam] = bucket.params_list
 
         shard_size = bucket_numel // data_parallel_size
 
         # Conver param_index(in buffer) into param_index(in bucket)
-        param_index_in_bucket_map: dict["VirtualParam", Range] = {}
+        param_index_in_bucket_map: dict[VirtualParam, Range] = {}
         for param in bucket_params:
             param_start_in_buffer, param_end_in_buffer, _ = param_index_map[param]
 
@@ -278,7 +325,7 @@ def get_ddp_buffer_distribution(
             ).normalize(bucket_start_index)
 
         # Split bucket by dp size
-        dp_to_params_distribution: list[dict["VirtualParam", Range]] = [
+        dp_to_params_distribution: list[dict[VirtualParam, Range]] = [
             None for i in range(data_parallel_size)
         ]
         for dp_rank in range(data_parallel_size):
@@ -291,15 +338,15 @@ def get_ddp_buffer_distribution(
             # Set param_start(in bucket) as global_offset
             for param, param_range in dp_to_params_distribution[dp_rank].items():
                 param_global_offset_in_buffer = param_index_in_bucket_map[param].start
-                setattr(param_range, "global_offset", param_global_offset_in_buffer)
+                param_range.global_offset = param_global_offset_in_buffer
         return dp_to_params_distribution
 
     def get_buckets_params_distribution() -> list[dict["VirtualParam", Range]]:
-        dp_to_params_distribution: list[dict["VirtualParam", Range]] = [
+        dp_to_params_distribution: list[dict[VirtualParam, Range]] = [
             {} for i in range(data_parallel_size)
         ]
         for bucket in ddp_buffer.buckets:
-            dp_to_params_distribution_in_bucket: list[dict["VirtualParam", Range]] = (
+            dp_to_params_distribution_in_bucket: list[dict[VirtualParam, Range]] = (
                 get_bucket_params_distribution(bucket)
             )
             assert len(dp_to_params_distribution_in_bucket) == data_parallel_size
@@ -337,15 +384,24 @@ def get_params_dp_distribution(
 
     dense_params: list[VirtualParam] = []
     moe_params_dict: dict[int, list[VirtualParam]] = {}  # key = ep_rank
+
+    # Bucketing must match actual Megatron DDP: DDP buckets by param.allreduce,
+    # and TE GroupedLinear flips expert allreduce to True when EP=1, so experts
+    # land in the dense bucket. The simulation uses name-based `.experts.` detection
+    # for stability, but the routing must agree with actual Megatron behaviour —
+    # a mismatch causes DistributedOptimizer shard positions to diverge from the
+    # simulated dst_aligned_global_rank, breaking optimizer tensor transfer.
+    experts_are_dense_bucketed = parallel_strategy.expert_is_dense_bucketed()
+
     for param in params:
-        if param.is_expert:
+        if param.is_expert and not experts_are_dense_bucketed:
             expert_id = param.param_position_attr.expert_id
             expert_parallel_rank = expert_id // expert_num_per_ep_rank
             moe_params_dict.setdefault(expert_parallel_rank, []).append(param)
         else:
             dense_params.append(param)
 
-    dense_params_dp_distribution: dict["VirtualParam", dict[int, Range]] = (
+    dense_params_dp_distribution: dict[VirtualParam, dict[int, Range]] = (
         get_ddp_buffer_distribution(
             dense_params, data_parallel_size, ddp_config, bucket_size
         )
@@ -354,7 +410,7 @@ def get_params_dp_distribution(
     if moe_params_dict:
         # Get param dp distribution in EP-Rank0
         moe_params_in_ep_rank0 = moe_params_dict[0]
-        moe_params_dp_distribution: dict["VirtualParam", dict[int, Range]] = (
+        moe_params_dp_distribution: dict[VirtualParam, dict[int, Range]] = (
             get_ddp_buffer_distribution(
                 moe_params_in_ep_rank0,
                 expert_data_parallel_size,
@@ -390,7 +446,7 @@ def transpose_and_sort_dp_distribution(
     dp_to_params_distribution: list[dict["VirtualParam", Range]],
     params: list["VirtualParam"],
 ) -> dict["VirtualParam", dict[int, Range]]:
-    params_dp_distribution: dict["VirtualParam", dict[int, Range]] = {
+    params_dp_distribution: dict[VirtualParam, dict[int, Range]] = {
         param: {} for param in params
     }
     for dp_rank, params_distribution in enumerate(dp_to_params_distribution):

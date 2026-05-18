@@ -13,10 +13,11 @@ Usage:
         # All tensors will be on meta device, no GPU memory allocated
 """
 
-import torch
-from functools import wraps
 from contextlib import contextmanager
+from functools import wraps
 from typing import Any
+
+import torch
 
 
 def _normalize_device(device: Any) -> str:

@@ -1,6 +1,6 @@
-from typing import List, Tuple
 import torch
 from megatron.core import parallel_state
+
 from ..distributed import ElasticProcessGroup
 
 
@@ -13,8 +13,9 @@ class MPUState:
             cls._mpu_default_attrs = {}
 
             attr_name_list = filter(
-                lambda attr_name: attr_name.startswith("_")
-                and not attr_name.startswith("__"),
+                lambda attr_name: (
+                    attr_name.startswith("_") and not attr_name.startswith("__")
+                ),
                 dir(parallel_state),
             )
 
@@ -26,9 +27,9 @@ class MPUState:
 
         return cls._mpu_default_attrs
 
-    def __init__(self, world_size: int, ranks: List[int] = None):
+    def __init__(self, world_size: int, ranks: list[int] = None):
         self._WORLD_GROUP: ElasticProcessGroup = None
-        self._WORLD_RANKS: List[int] = ranks
+        self._WORLD_RANKS: list[int] = ranks
         if self._WORLD_RANKS is None:
             self._WORLD_RANKS = list(range(world_size))
         else:
@@ -85,7 +86,7 @@ class MPUState:
         return len(self._WORLD_RANKS)
 
     @property
-    def world_ranks(self) -> List[int]:
+    def world_ranks(self) -> list[int]:
         return self._WORLD_RANKS
 
     @property
@@ -95,7 +96,7 @@ class MPUState:
 
 def get_union_world_group(
     src_mpu_state: MPUState, dst_mpu_state: MPUState
-) -> Tuple[ElasticProcessGroup, List[int]]:
+) -> tuple[ElasticProcessGroup, list[int]]:
     assert src_mpu_state.world_group is not None
     assert dst_mpu_state.world_group is not None
 

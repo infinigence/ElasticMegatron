@@ -1,22 +1,21 @@
-from typing import Dict, List, Tuple
+from dataclasses import dataclass
 
 import torch
 
 from .util import (
     ParamRange,
 )
-from dataclasses import dataclass
 
 
 @dataclass
 class TensorParallelReshardingInfo:
     # Key : src_tp_rank
     # Value : {dst_tp_rank: param_range}
-    send_info: Dict[int, Dict[int, ParamRange]]
+    send_info: dict[int, dict[int, ParamRange]]
 
     # Key : dst_tp_rank
     # Value : {src_tp_rank: param_range}
-    recv_info: Dict[int, Dict[int, ParamRange]]
+    recv_info: dict[int, dict[int, ParamRange]]
 
 
 class TensorParallelAttr:
@@ -38,22 +37,28 @@ class TensorParallelAttr:
         model_param: torch.nn.Parameter,
         parallel_group_size: int = 1,
         parallel_group_str: str = "TP",
+        force_unsharded: bool = False,
     ):
         self.parallel_group_size = parallel_group_size
         self.parallel_group_str = parallel_group_str
 
-        self.tensor_model_parallel = getattr(
-            model_param, "tensor_model_parallel", False
-        )
-        self.partition_dim = getattr(model_param, "partition_dim", -1)
-        self.partition_stride = getattr(model_param, "partition_stride", 1)
+        if force_unsharded:
+            self.tensor_model_parallel = False
+            self.partition_dim = -1
+            self.partition_stride = 1
+        else:
+            self.tensor_model_parallel = getattr(
+                model_param, "tensor_model_parallel", False
+            )
+            self.partition_dim = getattr(model_param, "partition_dim", -1)
+            self.partition_stride = getattr(model_param, "partition_stride", 1)
         assert self.partition_stride == 1, "Only support partition_stride==1"
 
         self._init_model_param_ranges(model_param.shape)
 
         # Cache
-        self._resharding_info_cache: Dict[
-            Tuple[int, int], TensorParallelReshardingInfo
+        self._resharding_info_cache: dict[
+            tuple[int, int], TensorParallelReshardingInfo
         ] = {}
 
     def _init_model_param_ranges(self, model_param_shape: torch.Size):
@@ -69,7 +74,7 @@ class TensorParallelAttr:
         )
         # Key : group Size
         # Value : ParamRange of the model weight of group rank-0
-        self._group_size_to_model_param_ranges: Dict[int, ParamRange] = {
+        self._group_size_to_model_param_ranges: dict[int, ParamRange] = {
             1: self.model_param_range_in_group,
         }
 
@@ -81,7 +86,7 @@ class TensorParallelAttr:
         if self._group_size_to_model_param_ranges.get(parallel_group_size) is not None:
             return self._group_size_to_model_param_ranges[parallel_group_size]
 
-        model_param_range_chunks: List[ParamRange] = (
+        model_param_range_chunks: list[ParamRange] = (
             self.model_param_range_in_group.chunk(
                 split=parallel_group_size, dim=self.partition_dim
             )
@@ -131,8 +136,8 @@ class TensorParallelAttr:
         )
         assert src_param_range.size == dst_param_range.size
 
-        send_info: Dict[int, Dict[int, ParamRange]] = {0: {}}
-        recv_info: Dict[int, Dict[int, ParamRange]] = {}
+        send_info: dict[int, dict[int, ParamRange]] = {0: {}}
+        recv_info: dict[int, dict[int, ParamRange]] = {}
         for dst_rank in range(dst_parallel_group_size):
             send_info[0][dst_rank] = src_param_range
             recv_info[dst_rank] = {0: src_param_range}
@@ -151,14 +156,14 @@ class TensorParallelAttr:
         if src_parallel_group_size == dst_parallel_group_size:
             assert src_param_range.size == dst_param_range.size
 
-        send_info: Dict[int, Dict[int, ParamRange]] = {}
-        recv_info: Dict[int, Dict[int, ParamRange]] = {}
+        send_info: dict[int, dict[int, ParamRange]] = {}
+        recv_info: dict[int, dict[int, ParamRange]] = {}
 
         # Scale-up : split src_tensor and send split results to dst_ranks
         if src_parallel_group_size < dst_parallel_group_size:
             # Split src tensor
             scale_up_ratio = dst_parallel_group_size // src_parallel_group_size
-            src_param_range_chunks: List[ParamRange] = src_param_range.chunk(
+            src_param_range_chunks: list[ParamRange] = src_param_range.chunk(
                 split=scale_up_ratio, dim=self.partition_dim
             )
 
@@ -177,7 +182,7 @@ class TensorParallelAttr:
         # Scale-down : split dst tensor and recv src tensors from src_ranks
         scale_down_ratio = src_parallel_group_size // dst_parallel_group_size
         # Split dst tensor
-        dst_param_range_chunks: List[ParamRange] = dst_param_range.chunk(
+        dst_param_range_chunks: list[ParamRange] = dst_param_range.chunk(
             split=scale_down_ratio, dim=self.partition_dim
         )
 

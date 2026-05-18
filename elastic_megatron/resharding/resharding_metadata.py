@@ -1,19 +1,19 @@
 import re
-from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
+
 import torch
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.optimizer import (
-    MegatronOptimizer,
     ChainedOptimizer,
     DistributedOptimizer,
+    MegatronOptimizer,
 )
 from megatron.training import get_args
-from .util import Range, ParamRange
 
 from ..megatron_manager.parallel_strategy import ParallelStrategy
-from .resharding_pp import ParamPositionAttr, LayerType
+from .resharding_pp import LayerType, ParamPositionAttr
 from .resharding_tp import TensorParallelAttr
+from .util import ParamRange, Range
 
 
 @dataclass
@@ -39,7 +39,7 @@ class OptimizerTensorInfo:
             == self.optimizer_tensor_range_in_model_param.size
         )
 
-    def update_optimizer_tensors(self, new_optimizer_tensors: List[torch.Tensor]):
+    def update_optimizer_tensors(self, new_optimizer_tensors: list[torch.Tensor]):
         """Update meta-device optimizer tensors by new optimizer tensors."""
         assert self.main_weight.device == torch.device("meta"), (
             "Only support update optimizer tensors on meta device"
@@ -189,7 +189,7 @@ MODEL_PARAM_TO_OPT_PARAM_INDEX = None
 
 
 def set_model_to_optimizer_index_dict(
-    model_to_optimizer_index_dict: Dict[torch.nn.Parameter, Tuple[int, int]],
+    model_to_optimizer_index_dict: dict[torch.nn.Parameter, tuple[int, int]],
 ):
     global MODEL_PARAM_TO_OPT_PARAM_INDEX
     MODEL_PARAM_TO_OPT_PARAM_INDEX = model_to_optimizer_index_dict
@@ -208,7 +208,7 @@ def init_model_to_optimizer_index_dict():
 def get_main_weight(
     optimizer: MegatronOptimizer,
     model_weight: torch.nn.Parameter,
-) -> Optional[torch.Tensor]:
+) -> torch.Tensor | None:
     if isinstance(optimizer, DistributedOptimizer):
         if model_weight in optimizer.model_param_group_index_map:
             group_index, group_order = optimizer.model_param_group_index_map[
@@ -220,7 +220,7 @@ def get_main_weight(
             return main_weight
         return None
 
-    model_to_optimizer_index_dict: Dict[torch.nn.Parameter, Tuple[int, int]] = (
+    model_to_optimizer_index_dict: dict[torch.nn.Parameter, tuple[int, int]] = (
         get_model_to_optimizer_index_dict()
     )
     if not model_to_optimizer_index_dict:
@@ -307,10 +307,19 @@ def get_optimizer_tensors(
 def get_tensor_parallel_attr(
     param: torch.nn.Parameter,
     tensor_model_parallel_size: int,
+    is_expert: bool = False,
 ) -> TensorParallelAttr:
-    tensor_model_parallel: bool = getattr(param, "tensor_model_parallel")
+    tensor_model_parallel: bool = param.tensor_model_parallel
     if not tensor_model_parallel:
         return TensorParallelAttr(model_param=param)
+    # MoE experts with TPE==1 are not actually TP-split, yet 0.16's TE
+    # GroupedLinear sets `partition_dim` to an implementation-defined default
+    # that differs between EP configs (EP>1 disables TE's parallel_mode, EP==1
+    # keeps it). Force the attr to "unsharded" for this specific case so src
+    # and dst metadata match during reshard. Dense params keep their real
+    # partition_dim/stride even at TP=1, since TP>1 peers need that info.
+    if is_expert and tensor_model_parallel_size == 1:
+        return TensorParallelAttr(model_param=param, force_unsharded=True)
 
     return TensorParallelAttr(
         model_param=param,
@@ -386,8 +395,21 @@ def get_param_position_attr(
     )
 
 
+def _is_expert_param(name: str, param: torch.nn.Parameter) -> bool:
+    """Decide whether a parameter belongs to a MoE expert.
+
+    The historical check ``not getattr(param, "allreduce", True)`` is unreliable
+    on Megatron 0.16: TE's GroupedLinear sets ``allreduce`` based on whether
+    ``expert_parallel`` is enabled (EP>1), so the same expert param flips from
+    ``False`` at EP=2 to ``True`` at EP=1. The module-path check below stays
+    consistent across EP sizes, which matters when we compare src and dst
+    reshard metadata for the same logical parameter.
+    """
+    return ".experts." in name
+
+
 def generate_optimizer_tensor_info(
-    model: List[DistributedDataParallel],
+    model: list[DistributedDataParallel],
     optimizer: MegatronOptimizer,
     offload_opt_tensors: bool = False,
 ) -> dict[torch.nn.Parameter, OptimizerTensorInfo]:
@@ -402,7 +424,7 @@ def generate_optimizer_tensor_info(
                 assert param.data.nelement() == 0
                 continue
 
-            is_expert = not getattr(param, "allreduce", True)
+            is_expert = _is_expert_param(name, param)
 
             optimizer_tensor_info: OptimizerTensorInfo = get_optimizer_tensors(
                 optimizer, param, offload_opt_tensors, is_expert
@@ -413,11 +435,11 @@ def generate_optimizer_tensor_info(
 
 
 def generate_resharding_metadata(
-    model: List[DistributedDataParallel],
+    model: list[DistributedDataParallel],
     optimizer: MegatronOptimizer,
     parallel_strategy: ParallelStrategy,
     offload_opt_tensors: bool = False,
-) -> Dict[torch.nn.Parameter, ParamReshardingMetaData]:
+) -> dict[torch.nn.Parameter, ParamReshardingMetaData]:
     """Generate resharding metadata.
 
     Args:
@@ -445,7 +467,7 @@ def generate_resharding_metadata(
                 assert param.data.nelement() == 0
                 continue
 
-            is_expert = not getattr(param, "allreduce", True)
+            is_expert = _is_expert_param(name, param)
 
             # Get the position attributes of the parameter.
             param_position_attr: ParamPositionAttr = get_param_position_attr(
@@ -467,6 +489,7 @@ def generate_resharding_metadata(
             tensor_parallel_attr: TensorParallelAttr = get_tensor_parallel_attr(
                 param,
                 parallel_strategy.get_tensor_model_parallel_size(is_expert),
+                is_expert=is_expert,
             )
 
             # Get the optimizer tensor info of the parameter.
@@ -486,7 +509,7 @@ def generate_resharding_metadata(
 
 
 def update_layer_index(
-    params_to_resharding_metadata: Dict[torch.nn.Parameter, ParamReshardingMetaData],
+    params_to_resharding_metadata: dict[torch.nn.Parameter, ParamReshardingMetaData],
 ):
     # Key = tuple(LayerType, transformer_layer_id)
     dense_layer_index_dict: dict[tuple[LayerType, int], int] = {}

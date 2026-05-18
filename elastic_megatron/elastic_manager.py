@@ -1,31 +1,29 @@
-from typing import Dict, Callable, List, Optional
+from collections.abc import Callable
+from contextlib import contextmanager, nullcontext
+from logging import Logger
+
 import torch
 import torch.distributed
 from megatron.core import parallel_state
-from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
+from .distributed import global_barrier_by_gloo
+from .megatron_manager.dataloader_state import DataloaderState
 from .megatron_manager.megatron_state import (
     MegatronStateManager,
     with_world_group,
 )
-from .transfer.transfer import TransferManager
+from .megatron_manager.parallel_strategy import ParallelStrategy
 from .megatron_manager.training_state import (
     TrainingState,
     update_optimizer_and_opt_param_scheduler,
 )
-from .resharding.virtual_param import build_virtual_model, VirtualParamSpace
 from .resharding.resharding_metadata import OptimizerTensorInfo
-from .distributed import global_barrier_by_gloo
-from .megatron_manager.parallel_strategy import ParallelStrategy
-
-from contextlib import contextmanager
-from .resharding.util import Timer
-from logging import Logger
-from .resharding.util import get_megatron_version_minor
-from .megatron_manager.dataloader_state import DataloaderState
-
-from contextlib import nullcontext
+from .resharding.util import Timer, get_megatron_version_minor
+from .resharding.virtual_param import VirtualParamSpace, build_virtual_model
+from .transfer.transfer import TransferManager
 
 
 class ElasticMegatronManager:
@@ -40,8 +38,8 @@ class ElasticMegatronManager:
 
     def __init__(
         self,
-        parallel_strategy_list: List[Dict[str, int]],
-        model: List[DDP],
+        parallel_strategy_list: list[dict[str, int]],
+        model: list[DDP],
         optimizer: MegatronOptimizer,
         opt_param_scheduler: OptimizerParamScheduler,
         send_fn: Callable = torch.distributed.send,
@@ -83,8 +81,8 @@ class ElasticMegatronManager:
 
     def _init_state_manager(
         self,
-        parallel_strategy_list: List[Dict[str, int]],
-        model: List[DDP],
+        parallel_strategy_list: list[dict[str, int]],
+        model: list[DDP],
         optimizer: MegatronOptimizer,
         opt_param_scheduler: OptimizerParamScheduler,
     ):
@@ -122,9 +120,9 @@ class ElasticMegatronManager:
         return t.elapsed
 
     def redundant_backup(
-        self, src_megatron_state, dst_megatron_state, is_sacle_up, is_meta_device
+        self, src_megatron_state, dst_megatron_state, is_scale_up, is_meta_device
     ) -> float:
-        if is_meta_device and is_sacle_up:
+        if is_meta_device and is_scale_up:
             with Timer() as t:
                 torch.distributed.broadcast(
                     torch.empty(1, device=torch.cuda.current_device()),
@@ -134,7 +132,7 @@ class ElasticMegatronManager:
 
         with Timer() as t:
             self.transfer_manager.redundant_backup(
-                is_sacle_up,
+                is_scale_up,
                 src_megatron_state.training_state,
                 dst_megatron_state.training_state,
             )
@@ -188,7 +186,7 @@ class ElasticMegatronManager:
 
     def reshard(
         self,
-        new_parallel_strategy: Dict[str, int],
+        new_parallel_strategy: dict[str, int],
         logger: Logger | None = None,
         is_meta_device: bool = False,
         save_ckpt: bool = False,
@@ -217,7 +215,7 @@ class ElasticMegatronManager:
             return src_megatron_state.training_state
 
         # Step-2 : Resharding params and transfer.
-        is_redundant_sacle_up: Optional[bool] = ParallelStrategy.is_redundant_backup(
+        is_redundant_sacle_up: bool | None = ParallelStrategy.is_redundant_backup(
             src_megatron_state.parallel_strategy, dst_megatron_state.parallel_strategy
         )
         if is_redundant_sacle_up is not None:
@@ -257,7 +255,7 @@ class ElasticMegatronManager:
 
         return dst_megatron_state.training_state
 
-    def get_data_parallel_group(self, parallel_strategy: Dict[str, int]):
+    def get_data_parallel_group(self, parallel_strategy: dict[str, int]):
         return self.state_manager.get_data_parallel_group(parallel_strategy)
 
     @classmethod

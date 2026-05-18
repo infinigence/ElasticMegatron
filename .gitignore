@@ -4,3 +4,5 @@ __pycache__/
 *.txt
 *.png
 *.log
+tools/ckpt/after_reshard/
+tools/ckpt/before_reshard/

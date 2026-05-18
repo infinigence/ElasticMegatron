@@ -1,24 +1,28 @@
 from copy import deepcopy
-from typing import Tuple
+
 import torch
+from megatron.core.tensor_parallel import set_tensor_model_parallel_attributes
 from megatron.training.global_vars import get_args
-from .resharding_metadata import ParamReshardingMetaData, get_tensor_parallel_attr
-from .resharding_pp import ParamPositionAttr, PipelineParallelReshardingInfo, LayerType
-from .resharding_tp import TensorParallelAttr, TensorParallelReshardingInfo
+
+from ..megatron_manager.megatron_state import MegatronState
+from ..megatron_manager.parallel_strategy import ParallelStrategy
+from .resharding import ReshardPlan
 from .resharding_dp import (
-    get_params_dp_distribution,
     DataParallelReshardingInfo,
     ExpertParallelReshardingInfo,
+    get_params_dp_distribution,
 )
-from .resharding import ReshardPlan
+from .resharding_metadata import (
+    OptimizerTensorInfo,
+    ParamReshardingMetaData,
+    get_tensor_parallel_attr,
+)
+from .resharding_pp import LayerType, ParamPositionAttr, PipelineParallelReshardingInfo
+from .resharding_tp import TensorParallelAttr, TensorParallelReshardingInfo
 from .util import (
     ParamRange,
     Range,
 )
-from ..megatron_manager.megatron_state import MegatronState
-from ..megatron_manager.parallel_strategy import ParallelStrategy
-from .resharding_metadata import OptimizerTensorInfo
-from megatron.core.tensor_parallel import set_tensor_model_parallel_attributes
 
 
 class VirtualTensor:
@@ -86,11 +90,15 @@ class VirtualParam:
         )
 
         # Cache
+        # _reshard_plan_cache 的 key 不含 self.is_expert / expert_is_dense_bucketed():
+        # 缓存是 per-VirtualParam 的(self.is_expert 是常量),而
+        # expert_is_dense_bucketed() 是 ParallelStrategy 的纯函数,已跟随
+        # (src_strategy, dst_strategy) 一起进入 key。重构 key 时请保留这条假设。
         self._dp_distribution_cache: dict[
-            Tuple[ParallelStrategy, bool], dict[int, Range]
+            tuple[ParallelStrategy, bool], dict[int, Range]
         ] = {}
         self._reshard_plan_cache: dict[
-            Tuple[ParallelStrategy, ParallelStrategy, bool], ReshardPlan
+            tuple[ParallelStrategy, ParallelStrategy, bool], ReshardPlan
         ] = {}
 
         # Optimizer Info
@@ -198,13 +206,19 @@ class VirtualParam:
         with_ddp: bool,
     ) -> ReshardPlan:
         """Reshard the parameter from src_parallel_strategy to dst_parallel_strategy."""
+
         # Step-1 : TP / TPEP
-        src_tensor_model_parallel_size = (
-            src_parallel_strategy.get_tensor_model_parallel_size(self.is_expert)
-        )
-        dst_tensor_model_parallel_size = (
-            dst_parallel_strategy.get_tensor_model_parallel_size(self.is_expert)
-        )
+        # When EP=1, Megatron replicates expert params across the dense TP ranks,
+        # so the effective TP size for planning must be the dense tp_size rather
+        # than TPE. Without this, recv ranks at tp_rank>0 get no broadcast entry
+        # and the transfer plan has holes.
+        def _effective_tp_size(ps: ParallelStrategy) -> int:
+            if self.is_expert and ps.expert_is_dense_bucketed():
+                return ps.get_tensor_model_parallel_size(is_expert=False)
+            return ps.get_tensor_model_parallel_size(self.is_expert)
+
+        src_tensor_model_parallel_size = _effective_tp_size(src_parallel_strategy)
+        dst_tensor_model_parallel_size = _effective_tp_size(dst_parallel_strategy)
         tensor_parallel_resharding_info: TensorParallelReshardingInfo = (
             self.tensor_parallel_attr.reshard(
                 src_tensor_model_parallel_size, dst_tensor_model_parallel_size
@@ -225,9 +239,9 @@ class VirtualParam:
         )
 
         # Step-3 : EP
-        expert_parallel_reshardign_info = None
+        expert_parallel_resharding_info = None
         if self.is_expert:
-            expert_parallel_reshardign_info = ExpertParallelReshardingInfo(
+            expert_parallel_resharding_info = ExpertParallelReshardingInfo(
                 self.param_position_attr.expert_id,
                 src_parallel_strategy,
                 dst_parallel_strategy,
@@ -245,7 +259,7 @@ class VirtualParam:
                 src_parallel_strategy=src_parallel_strategy,
                 dst_parallel_strategy=dst_parallel_strategy,
                 pipeline_parallel_resharding_info=pipeline_parallel_resharding_info,
-                expert_parallel_reshardign_info=expert_parallel_reshardign_info,
+                expert_parallel_resharding_info=expert_parallel_resharding_info,
             )
         )
 
@@ -253,7 +267,7 @@ class VirtualParam:
             tensor_parallel_resharding_info=tensor_parallel_resharding_info,
             pipeline_parallel_resharding_info=pipeline_parallel_resharding_info,
             data_parallel_resharding_info=data_parallel_resharding_info,
-            expert_parallel_reshardign_info=expert_parallel_reshardign_info,
+            expert_parallel_resharding_info=expert_parallel_resharding_info,
             src_parallel_strategy=src_parallel_strategy,
             dst_parallel_strategy=dst_parallel_strategy,
         )
@@ -437,12 +451,11 @@ class VirtualParamSpace:
                     if (
                         param.param_position_attr.expert_id
                         == param_position_attr.expert_id
+                    ) and (
+                        param.param_position_attr.expert_param_layer_id
+                        == param_position_attr.expert_param_layer_id
                     ):
-                        if (
-                            param.param_position_attr.expert_param_layer_id
-                            == param_position_attr.expert_param_layer_id
-                        ):
-                            return param
+                        return param
                 raise ValueError(f"{param_position_attr=} can't find virtual param")
 
             return transfer_layer_params[param_position_attr.layer_index]

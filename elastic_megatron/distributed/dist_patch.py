@@ -1,8 +1,10 @@
-from functools import wraps
-import torch
 import inspect
-from .util import get_all_dist_functions_with_group
+from functools import wraps
+
+import torch
+
 from .elastic_process_group import ElasticProcessGroup
+from .util import get_all_dist_functions_with_group
 
 
 def dist_wrapper(fn, patch_group_arg: bool = True):
@@ -24,9 +26,8 @@ def dist_wrapper(fn, patch_group_arg: bool = True):
     @wraps(fn)
     def wrapper(*args, **kwargs):
         # If grpup is provided and is not None, return origin func call
-        if fn.__name__ == "isend":
-            if "group_src" in kwargs:
-                kwargs["group_dst"] = kwargs.pop("group_src")
+        if fn.__name__ == "isend" and "group_src" in kwargs:
+            kwargs["group_dst"] = kwargs.pop("group_src")
         if len(args) > group_index:
             args = list(args)
             if isinstance(args[group_index], ElasticProcessGroup):

@@ -1,12 +1,13 @@
+from collections.abc import Callable
 from contextlib import contextmanager
-from megatron.core import num_microbatches_calculator
+from copy import deepcopy
+from functools import wraps
+
+import torch
+from megatron.core import num_microbatches_calculator, parallel_state
 from megatron.core.num_microbatches_calculator import ConstantNumMicroBatchesCalculator
 from megatron.core.pipeline_parallel import schedules
-from megatron.core import parallel_state
-import torch
-from functools import wraps
-from typing import Callable
-from copy import deepcopy
+
 from .resharding.util import get_megatron_version_minor
 
 
@@ -102,6 +103,15 @@ def process_fwd_bwd_outputs_for_pretrain_gpt(forward_data_store: list):
             ).cuda()
         elif megatron_version_minor == 13:
             loss_reduced_tensor = loss_reduced.view(-1).cuda()
+        elif megatron_version_minor >= 16:
+            # 0.16+ 的 forward_data_store / loss reduction 形状在 PR sweep 中
+            # 未被覆盖;ElasticMegatron 当前没有任何调用方走这条路径(apply_hetero_dp
+            # 在 Phase B 全部实验里都没被调用)。如果将来要支持,需要重新对 0.16+
+            # 下 loss_reduced 的实际类型确认后再加分支。
+            raise NotImplementedError(
+                f"hetero_dp not yet adapted to Megatron {megatron_version_minor}; "
+                f"see hetero_dp.py docstring."
+            )
         else:
             raise ValueError(
                 f"Unsupported Megatron minor version: {megatron_version_minor}"
@@ -116,6 +126,15 @@ def process_fwd_bwd_outputs_for_pretrain_gpt(forward_data_store: list):
             }
         elif megatron_version_minor == 13:
             forward_data_store[i] = {"lm loss": loss_reduced_tensor.view(-1)}
+        elif megatron_version_minor >= 16:
+            # 0.16+ 的 forward_data_store / loss reduction 形状在 PR sweep 中
+            # 未被覆盖;ElasticMegatron 当前没有任何调用方走这条路径(apply_hetero_dp
+            # 在 Phase B 全部实验里都没被调用)。如果将来要支持,需要重新对 0.16+
+            # 下 loss_reduced 的实际类型确认后再加分支。
+            raise NotImplementedError(
+                f"hetero_dp not yet adapted to Megatron {megatron_version_minor}; "
+                f"see hetero_dp.py docstring."
+            )
         else:
             raise ValueError(
                 f"Unsupported Megatron minor version: {megatron_version_minor}"

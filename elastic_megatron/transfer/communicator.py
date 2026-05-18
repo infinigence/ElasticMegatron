@@ -1,6 +1,7 @@
-from typing import Dict, List, Set, Callable
-import torch
 import queue
+from collections.abc import Callable
+
+import torch
 
 
 class Communicator:
@@ -22,13 +23,13 @@ class Communicator:
 
         # Store NCCL connection information
         self._build_nccl_connection_only = False
-        self._p2p_connections: Set[int] = set()
-        self._collective_connections: Set[torch.distributed.ProcessGroup] = set()
+        self._p2p_connections: set[int] = set()
+        self._collective_connections: set[torch.distributed.ProcessGroup] = set()
         self.dummy_tensor = torch.empty(1, device=torch.cuda.current_device())
 
         # Record communication bytes
         self._communication_bytes = 0
-        self._group_to_ranks: Dict[torch.distributed.ProcessGroup, List[int]] = {
+        self._group_to_ranks: dict[torch.distributed.ProcessGroup, list[int]] = {
             None: [i for i in range(torch.distributed.get_world_size())]
         }
 

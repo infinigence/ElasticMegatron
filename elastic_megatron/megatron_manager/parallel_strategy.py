@@ -1,8 +1,8 @@
 from dataclasses import dataclass
+
 import torch
 from megatron.core import parallel_state
 from megatron.training.global_vars import get_args
-from typing import List, Optional
 
 from .rank_generator import ElasticRankGenerator
 
@@ -19,7 +19,7 @@ class ParallelStrategy:
     sequence_parallel: bool = None
 
     order: str = "tp-cp-ep-dp-pp"
-    ranks: List[int] = None
+    ranks: list[int] = None
 
     def __post_init__(self):
         self._rank = torch.distributed.get_rank()
@@ -96,6 +96,17 @@ class ParallelStrategy:
             return self.expert_tensor_parallel_rank
         return self.tensor_model_parallel_rank
 
+    def expert_is_dense_bucketed(self) -> bool:
+        """True iff expert params live in the dense DDP bucket under this strategy.
+
+        When EP=1, TE GroupedLinear flips expert ``allreduce`` to True, so DDP
+        buckets experts together with dense params. The DistributedOptimizer shard
+        layout then follows the dense (tp, dp) grid rather than the expert
+        (etp, edp, ep) grid. All DP-bucket simulation, global-rank mapping, and
+        TP-split planning must branch on this flag to stay consistent with Megatron.
+        """
+        return self.expert_model_parallel_size == 1
+
     def _init_group_zero(self):
         if self.num_distributed_optimizer_instances > 1:
             assert self.context_parallel_size > 1, (
@@ -121,7 +132,7 @@ class ParallelStrategy:
                 f"decoder world_size ({self.world_size}) is not divisible by expert_tensor_model_pipeline_parallel size ({self.expert_tensor_model_pipeline_parallel_size})"
             )
 
-    def get_ranks(self, group_type, is_expert=False, **kwargs) -> Optional[list[int]]:
+    def get_ranks(self, group_type, is_expert=False, **kwargs) -> list[int] | None:
         for ranks in self.rank_generator.generator_wrapper(
             group_type, is_expert, **kwargs
         ):
@@ -214,6 +225,8 @@ class ParallelStrategy:
             "num_distributed_optimizer_instances",
             "expert_model_parallel_size",
             "expert_tensor_parallel_size",
+            # Must sync to global args: MoE forward raises on TP>1 without SP.
+            "sequence_parallel",
         ]:
             setattr(args, key, getattr(self, key))
         args.data_parallel_size = self.get_data_parallel_world_size(
@@ -235,7 +248,7 @@ class ParallelStrategy:
     def is_redundant_backup(
         src_parallel_strategy: "ParallelStrategy",
         dst_parallel_strategy: "ParallelStrategy",
-    ) -> Optional[bool]:
+    ) -> bool | None:
         src_group_size = src_parallel_strategy.num_distributed_optimizer_instances
         dst_group_size = dst_parallel_strategy.num_distributed_optimizer_instances
         if src_group_size == dst_group_size:

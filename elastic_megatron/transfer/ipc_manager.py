@@ -1,9 +1,11 @@
-import sys
 import pickle
-import zmq
+import sys
+
 import torch
+import zmq
 from megatron.training.global_vars import get_args
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
+
 from ..resharding.resharding_metadata import generate_optimizer_tensor_info
 
 
@@ -67,8 +69,8 @@ def send_training_state(
         3. exit the current process after exporting the state
 
     """
-    import zmq
     import torch
+    import zmq
     from megatron.training.training import get_parallel_strategy_list
 
     if cur_parallel_strategy is None:

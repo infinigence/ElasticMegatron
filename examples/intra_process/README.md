@@ -124,4 +124,8 @@ def train(...):
 ```
 
 
-* If using Megatron 0.11 for training, you can directly replace `megatron/training/training.py` with `examples/intra_process/training_011.py`
+* If using Megatron 0.11 for training, you can directly replace `megatron/training/training.py` with `examples/intra_process/training_011.py`.
+* If using Megatron 0.16 for training, you can directly replace `megatron/training/training.py` with `examples/intra_process/training_016.py`. It is a snapshot of a working `training.py` after applying the ElasticMegatron patches required for 0.16, including:
+  - `ELASTIC_ENABLED` / `ELASTIC_STRATEGY_MODE` / `ELASTIC_RESHARD_INTERVAL` env-var driven `init_parallel_strategy_list` / `check_reshard` / `init_elastic_megatron_manager`.
+  - `ELASTIC_SAVE_CKPT=1` hook inside `train()` that saves before/after-reshard ckpts for offline verification (see `tools/ckpt/verify_all.sh`).
+  - `model[:] = training_state.model` slice-assignment inside the elastic loop so `pretrain()`'s `model` reference stays live for the post-train `evaluate_and_print_results` (avoids `setStorage size 0` on the embedding weight after reshard).
