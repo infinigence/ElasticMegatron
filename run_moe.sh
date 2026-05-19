@@ -41,8 +41,8 @@ MODEL_ARGS=(
     --seq-length 4096
     --max-position-embeddings 32768
     --num-layers 2
-    --hidden-size 2048
-    --ffn-hidden-size 768
+    --hidden-size 4096
+    --ffn-hidden-size 11008
     --num-attention-heads 32
     --init-method-std 0.008
     --attention-dropout 0.0
