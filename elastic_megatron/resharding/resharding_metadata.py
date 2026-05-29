@@ -16,32 +16,121 @@ from .resharding_tp import TensorParallelAttr
 from .util import ParamRange, Range
 
 
+# Canonical ordering of per-param optimizer-state keys. The SRC side discovers
+# states from an already-initialized optimizer.state dict; the DST side allocates
+# empty placeholders during offload. The transfer zips src/dst optimizer_tensors
+# positionally, so both sides MUST enumerate states in the same order. Known Adam
+# moments come first in a fixed order; any other param-shaped states are appended
+# alphabetically. Non-param-shaped entries (e.g. a scalar ``step``) are dropped —
+# they are not transferred here (step is synced via param_groups, see I-5).
+_ADAM_STATE_KEYS = ("exp_avg", "exp_avg_sq")
+
+# State-dict entries that must never be transferred as a separate state:
+#   - "master_param": Megatron's HybridDeviceOptimizer (param_update_in_fp32=True)
+#     stores the fp32 master copy here. It IS the master (already states[0]); emitting
+#     it again would transfer the master twice / corrupt the multiset.
+#   - "step": a per-param scalar; synced via param_groups (see invariants I-5). It is
+#     also dropped by the param-shaped filter, but we exclude it by name for clarity.
+_NON_TRANSFER_STATE_KEYS = ("master_param", "step")
+
+
+def ordered_optimizer_state_keys(state: dict, anchor_numel: int) -> list[str]:
+    """Param-shaped state keys of one param, in a deterministic transfer order."""
+
+    def is_param_shaped(v) -> bool:
+        return torch.is_tensor(v) and v.numel() == anchor_numel
+
+    keys = [
+        k
+        for k in state
+        if k not in _NON_TRANSFER_STATE_KEYS and is_param_shaped(state[k])
+    ]
+    known = [k for k in _ADAM_STATE_KEYS if k in keys]
+    extra = sorted(k for k in keys if k not in _ADAM_STATE_KEYS)
+    return known + extra
+
+
+def _is_hybrid_device_optimizer(inner_optimizer) -> bool:
+    """True if the inner torch optimizer is Megatron's HybridDeviceOptimizer.
+
+    Detected by class name to avoid a hard import dependency on Megatron versions
+    that lack the cpu_offloading module. HDO keeps its authoritative state inside
+    device-specific sub-optimizers; its ``.state`` is a synced view, ``init_state_fn``
+    is None, and the fp32 master/CPU-offloaded moments may live on different devices
+    (see docs/project/optimizer_state_model.md and docs/hybrid_adam/).
+    """
+    for klass in type(inner_optimizer).__mro__:
+        if klass.__name__ == "HybridDeviceOptimizer":
+            return True
+    return False
+
+
+@dataclass
+class OptState:
+    """One named optimizer-state tensor of a param (master copy or a moment).
+
+    ``device`` / ``dtype`` are read from ``tensor``. The reshard geometry
+    (dp_distribution / reshard plan) is computed once per param from the master
+    and reused for every state, which requires every state to be *param-shaped*
+    (same numel as the master). Non-param-shaped states (e.g. FP8 per-block
+    scales) are not supported — see invariants I-15.
+    """
+
+    name: str
+    tensor: torch.Tensor
+
+
 @dataclass
 class OptimizerTensorInfo:
-    main_weight: torch.Tensor
-    exp_avg: torch.Tensor
-    exp_avg_sq: torch.Tensor
+    # Ordered, variable-length set of named states. ``states[0]`` is the master
+    # weight and serves as the geometry anchor. Adam => [main_weight, exp_avg,
+    # exp_avg_sq]; other optimizers may carry a different count/dtype per state.
+    states: list[OptState]
     optimizer_tensor_range_in_model_param: (
         ParamRange  # sub-range of the param that this data-parallel rank owns.
     )
     model_param_range: ParamRange
 
     def __post_init__(self):
-        self.optimizer_tensor_shape = self.main_weight.shape
-        self.optimizer_tensors = [self.main_weight, self.exp_avg, self.exp_avg_sq]
+        assert len(self.states) >= 1, "need at least the master-weight state"
+        # Working list; create_padded swaps this to padded buffers and back.
+        self.optimizer_tensors = [s.tensor for s in self.states]
+        self.state_names = [s.name for s in self.states]
+        self.optimizer_tensor_shape = self.states[0].tensor.shape
 
+        anchor_numel = self.optimizer_tensor_shape.numel()
+        for s in self.states:
+            assert s.tensor.numel() == anchor_numel, (
+                f"optimizer state '{s.name}' is not param-shaped "
+                f"({s.tensor.numel()} != {anchor_numel} elems). Non-param-shaped "
+                "states (e.g. FP8 per-block scales) are unsupported; see I-15."
+            )
         assert (
             self.optimizer_tensor_range_in_model_param.size
             <= self.model_param_range.size
         )
-        assert (
-            self.optimizer_tensor_shape.numel()
-            == self.optimizer_tensor_range_in_model_param.size
-        )
+        assert anchor_numel == self.optimizer_tensor_range_in_model_param.size
+
+    # --- read-only accessors; main_weight/exp_avg/exp_avg_sq are the real (never
+    # padded) state tensors, kept for Adam-shaped call sites (e.g. ipc_manager). ---
+    @property
+    def main_weight(self) -> torch.Tensor:
+        return self.states[0].tensor
+
+    def state_tensor(self, name: str) -> torch.Tensor:
+        return self.states[self.state_names.index(name)].tensor
+
+    @property
+    def exp_avg(self) -> torch.Tensor:
+        return self.state_tensor("exp_avg")
+
+    @property
+    def exp_avg_sq(self) -> torch.Tensor:
+        return self.state_tensor("exp_avg_sq")
 
     def update_optimizer_tensors(self, new_optimizer_tensors: list[torch.Tensor]):
         """Update meta-device optimizer tensors by new optimizer tensors."""
-        assert self.main_weight.device == torch.device("meta"), (
+        assert self.states[0].tensor.device == torch.device("meta"), (
             "Only support update optimizer tensors on meta device"
         )
         assert len(new_optimizer_tensors) == len(self.optimizer_tensors)
@@ -50,9 +139,8 @@ class OptimizerTensorInfo:
         ):
             assert old_tensor.shape == new_tensor.shape
             assert old_tensor.dtype == new_tensor.dtype
-        self.main_weight = new_optimizer_tensors[0]
-        self.exp_avg = new_optimizer_tensors[1]
-        self.exp_avg_sq = new_optimizer_tensors[2]
+        for s, new_tensor in zip(self.states, new_optimizer_tensors):
+            s.tensor = new_tensor
         self.optimizer_tensors = new_optimizer_tensors
 
     def rebuild(self):
@@ -76,13 +164,16 @@ class OptimizerTensorInfo:
 
         model_param_shape: torch.Size = self.model_param_range.to_torch_size()
 
+        # One padded buffer per state, each with that state's OWN dtype/device
+        # (Adam: all match the master; this generalizes to per-state dtype and to
+        # CPU-resident states without special-casing).
         self.padded_optimizer_tensors = [
             torch.empty(
                 model_param_shape,
-                dtype=self.main_weight.dtype,
-                device=self.main_weight.device,
+                dtype=t.dtype,
+                device=t.device,
             ).view(-1)
-            for _ in range(3)
+            for t in self.optimizer_tensors
         ]
         self.origin_optimizer_tensors = self.optimizer_tensors
         self.optimizer_tensors = self.padded_optimizer_tensors
@@ -236,10 +327,17 @@ def get_main_weight(
 def init_empty_state_dict(
     optimizer: MegatronOptimizer, main_weight: torch.nn.Parameter
 ):
-    optimizer.state[main_weight]["exp_avg"] = torch.zeros_like(main_weight.data)
-    optimizer.state[main_weight]["exp_avg_sq"] = torch.zeros_like(main_weight.data)
-    optimizer.state[main_weight]["exp_avg"].storage().resize_(0)
-    optimizer.state[main_weight]["exp_avg_sq"].storage().resize_(0)
+    """Allocate empty (storage-0) placeholder states for the offload path.
+
+    F1 default schema = Adam moments. The DST optimizer is freshly built so its
+    state dict is empty; we pre-create the keys the SRC side will send so the
+    positional transfer lines up, then resize their storage to 0. A non-Adam
+    optimizer (e.g. Muon's ``momentum``) needs its own offload schema here; the
+    already-initialized SRC path discovers keys generically and needs no change.
+    """
+    for key in _ADAM_STATE_KEYS:
+        optimizer.state[main_weight][key] = torch.zeros_like(main_weight.data)
+        optimizer.state[main_weight][key].storage().resize_(0)
 
 
 def get_optimizer_tensors_by_model_weight(
@@ -258,7 +356,21 @@ def get_optimizer_tensors_by_model_weight(
 
     # Init optimizer.state. If offload_opt_tensors is True, offload the optimizer tensors.
     if not state_initialized:
-        if not offload_opt_tensors:
+        if _is_hybrid_device_optimizer(optimizer.optimizer):
+            # HDO's .state is a view synced from device-specific sub-optimizers, and
+            # init_state_fn is None — writing init_empty_state_dict would not connect
+            # to the real sub-optimizer tensors. dummy_step() allocates the real state
+            # (exp_avg/exp_avg_sq) on each sub-optimizer's own device (CPU for offloaded
+            # params, GPU otherwise) and syncs it into .state. On the dst this is safe:
+            # both the state values and the dummy-grad param perturbation are overwritten
+            # by the reshard transfer. The CPU-resident moments then ride the device-aware
+            # transport in communicator.py. We offload only the master here; the moments
+            # stay allocated and are received in place (rebuild() is a no-op for them).
+            # NOTE: meta-device HDO build is not handled (dummy_step needs real storage).
+            optimizer.optimizer.dummy_step()
+            if offload_opt_tensors:
+                main_weight.storage().resize_(0)
+        elif not offload_opt_tensors:
             optimizer.init_state_fn(optimizer.optimizer)
         else:
             init_empty_state_dict(optimizer.optimizer, main_weight)
@@ -275,10 +387,46 @@ def get_optimizer_tensors_by_model_weight(
     else:
         sub_range_in_model_param = ParamRange(param_shape=model_weight.shape)
 
+    use_precision_aware = isinstance(optimizer, DistributedOptimizer) and getattr(
+        getattr(optimizer, "config", None), "use_precision_aware_optimizer", False
+    )
+
+    if use_precision_aware:
+        # Under --use-precision-aware-optimizer (required by HybridDeviceOptimizer),
+        # optimizer.param_groups holds the bf16/fp16 model SHARD, not the fp32 master —
+        # the master + (unscaled) moments live in optimizer state and must be read via
+        # Megatron's own accessor, which returns {"param": fp32 master, "exp_avg",
+        # "exp_avg_sq", ...}. For HDO those are the real state tensors (references), so
+        # the in-place reshard recv updates the optimizer. (Reading param_groups directly
+        # — as get_main_weight does — yields the bf16 shard of a FusedAdam-managed buffer
+        # and crashes the transfer with an async "CUDA error: invalid argument".)
+        # NOTE: only verified-by-design for the HDO branch of _get_main_param_and_
+        # optimizer_states; non-HDO precision-aware returns unscaled COPIES (set_scaled_
+        # state needed on write-back) and is not handled here.
+        td = optimizer._get_main_param_and_optimizer_states(model_weight)
+        master = td["param"]
+        anchor_numel = master.numel()
+        states = [OptState("main_weight", master)]
+        for key in ("exp_avg", "exp_avg_sq"):
+            if key in td:
+                states.append(OptState(key, td[key]))
+        for key, val in td.items():
+            if key in ("param", "exp_avg", "exp_avg_sq"):
+                continue
+            if torch.is_tensor(val) and val.numel() == anchor_numel:
+                states.append(OptState(key, val))
+    else:
+        # Discover states generically: master + every param-shaped state in the
+        # optimizer's state dict, in canonical order. For Adam this yields exactly
+        # [main_weight, exp_avg, exp_avg_sq] (a scalar `step`, if present, is dropped
+        # by the param-shaped filter), so the Adam transfer is unchanged.
+        state = optimizer.optimizer.state[main_weight]
+        states = [OptState("main_weight", main_weight)]
+        for key in ordered_optimizer_state_keys(state, opt_tensor_shape.numel()):
+            states.append(OptState(key, state[key]))
+
     return OptimizerTensorInfo(
-        main_weight=main_weight,
-        exp_avg=optimizer.optimizer.state[main_weight]["exp_avg"],
-        exp_avg_sq=optimizer.optimizer.state[main_weight]["exp_avg_sq"],
+        states=states,
         optimizer_tensor_range_in_model_param=sub_range_in_model_param,
         model_param_range=ParamRange(param_shape=model_weight.shape),
     )

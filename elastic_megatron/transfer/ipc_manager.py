@@ -87,7 +87,12 @@ def send_training_state(
     params = list(metadata_map.keys())
 
     share_dict = {}
-    # send optimizer tensors (fp32/exp_avg/exp_avg_sq) for each param
+    # send optimizer tensors (fp32/exp_avg/exp_avg_sq) for each param.
+    # NOTE: this inter-process path still assumes Adam-shaped states (master +
+    # the two moments). After the F1 state-model generalization the intra-process
+    # path is state-agnostic; this path is not yet (no inter-process test covers
+    # it). To support non-Adam optimizers here, iterate opt_info.states / .state_names
+    # instead of the hard-coded triple below. See docs/project/optimizer_state_model.md.
     for p in params:
         opt_info = metadata_map[p]
         if opt_info is None:
