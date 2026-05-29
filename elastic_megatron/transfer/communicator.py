@@ -59,6 +59,10 @@ class Communicator:
     def set_fake_transfer(self, fake_transfer: bool):
         self._build_nccl_connection_only = fake_transfer
 
+    @staticmethod
+    def _is_cuda(tensor: torch.Tensor) -> bool:
+        return tensor.device.type == "cuda"
+
     def send(
         self,
         tensor: torch.Tensor,
@@ -71,6 +75,10 @@ class Communicator:
         if dst == self._rank:
             return self._send_self(tensor.clone().detach().contiguous())
 
+        # NCCL only moves CUDA tensors. A non-CUDA (e.g. CPU-offloaded optimizer)
+        # state is staged through a GPU bounce buffer before the send.
+        if not self._is_cuda(tensor):
+            tensor = tensor.to(torch.cuda.current_device(), non_blocking=True)
         self.send_fn(tensor.contiguous(), dst=dst, *args, **kwargs)
 
         self._communication_bytes += tensor.nbytes
@@ -87,7 +95,16 @@ class Communicator:
         if src == self._rank:
             return self._recv_self(tensor)
 
-        if not tensor.is_contiguous():
+        # NCCL only moves CUDA tensors. For a non-CUDA destination, receive into a
+        # GPU bounce buffer and copy back (this also covers the non-contiguous case
+        # since the bounce buffer is contiguous).
+        if not self._is_cuda(tensor):
+            recv_on_gpu = torch.empty(
+                tensor.shape, dtype=tensor.dtype, device=torch.cuda.current_device()
+            )
+            self.recv_fn(recv_on_gpu, src=src, *args, **kwargs)
+            tensor.data.copy_(recv_on_gpu)
+        elif not tensor.is_contiguous():
             recv_tensor_contiguous = torch.empty_like(tensor)
             self.recv_fn(recv_tensor_contiguous, src=src, *args, **kwargs)
             tensor.data.copy_(recv_tensor_contiguous)
@@ -106,7 +123,14 @@ class Communicator:
         if self._build_nccl_connection_only:
             return self._build_collective_connection(group, self.broadcast_fn)
 
-        self.broadcast_fn(tensor, *args, **kwargs)
+        # NCCL broadcast needs a CUDA tensor; stage CPU tensors through GPU and
+        # copy the result back (every rank in the group does the same).
+        if not self._is_cuda(tensor):
+            gpu_tensor = tensor.to(torch.cuda.current_device(), non_blocking=True)
+            self.broadcast_fn(gpu_tensor, *args, **kwargs)
+            tensor.data.copy_(gpu_tensor)
+        else:
+            self.broadcast_fn(tensor, *args, **kwargs)
 
         if self._group_to_ranks.get(group) is None:
             self._group_to_ranks[group] = torch.distributed.get_process_group_ranks(
