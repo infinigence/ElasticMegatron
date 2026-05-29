@@ -154,3 +154,20 @@ Any code that walks `VirtualParamSpace.all_virtual_params` and then calls `apply
 - `VirtualParamSpace._build_stages_virtual_params` — already filters by `stage_id != -1`.
 - `VirtualParamSpace.register_reshard` — uses `is_orphan_for`.
 - `TransferManager.transfer_optimizer_tensors` — already has the equivalent guard via `virtual_param.shared_embedding and layer_type == OUTPUT_LAYER` (`transfer.py:317-329`). If a future change introduces a non-OUTPUT_LAYER orphan, prefer the stage-id-based predicate over the attribute-based one.
+
+---
+
+## I-15. Every optimizer state of a param is param-shaped and shares the param's single reshard plan
+
+**Rule.** `OptimizerTensorInfo` (`resharding_metadata.py`) holds an ordered, variable-length list of named `OptState`s; `states[0]` is the master weight and the geometry anchor. **Every** state tensor must have the same `numel` as the master. The reshard geometry (`dp_distribution` + `ReshardPlan`) is computed **once per param from the master** and reused for all states — this is only valid because they are param-shaped. Per-state `dtype` and `device` may differ (Adam: all equal); `create_padded_optimizer_tensor` allocates each padded buffer with its state's own dtype/device, and `transfer/communicator.py` stages non-CUDA tensors through a GPU bounce buffer.
+
+**Corollaries.**
+- State discovery is deterministic and name-based: `ordered_optimizer_state_keys()` keeps only param-shaped tensors (a scalar per-param `step`, if any, is dropped — synced via param_groups, see I-5) and orders Adam moments first, so the SRC (initialized) and DST (offload-allocated) sides enumerate states in the same positional order.
+- src and dst must carry the **same** ordered state set per param; `transfer.py::_main_process` asserts `src.state_names == dst.state_names` when both are present on a rank.
+- The DST offload path (`init_empty_state_dict`) still encodes "which states exist" for a not-yet-initialized optimizer — defaults to the Adam moments. A non-Adam optimizer (e.g. Muon's `momentum`) needs its own offload schema there.
+
+**Not supported (guarded).** Non-param-shaped states — FP8/FP4 per-block `scale`/`amax`. `OptimizerTensorInfo.__post_init__` raises an `AssertionError` rather than silently mishandling them; supporting them needs a second transport path (replicate/broadcast) and block-vs-shard alignment.
+
+**Failure mode if broken.** Adding a non-param-shaped state trips the `__post_init__` assert immediately. A src/dst state-set mismatch (heterogeneous optimizer without matching schema) trips the `_main_process` assert, or — if that rank holds only one side — desyncs the positional send/recv counts into an NCCL hang.
+
+See [`optimizer_state_model.md`](optimizer_state_model.md) for the full contract and [`../hybrid_adam/`](../hybrid_adam/) for the work that introduced this model.

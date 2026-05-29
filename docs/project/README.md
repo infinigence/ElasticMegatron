@@ -45,9 +45,11 @@ The full patched 0.16 file is at [`examples/intra_process/training_016.py`](../.
 - [`architecture.md`](architecture.md) — the six-step reshard pipeline in detail, with state flow
 - [`debugging.md`](debugging.md) — the four reshard failure modes (NCCL hang / `setStorage size 0` / optimizer NoneType / TP attr assert) and how to triage them
 - [`cross_repo.md`](cross_repo.md) — ElasticMegatron vs Megatron-LM-custom: what each owns, what's the patching contract
+- [`optimizer_state_model.md`](optimizer_state_model.md) — how a param's optimizer state is represented and moved; **read before adding a new optimizer** (CPU/hybrid offload, Muon, FP8)
 
 ## When you are about to change code
 
 - If you are about to touch `resharding/`, `transfer/`, or `megatron_manager/` — read [`invariants.md`](invariants.md) first. Several rules are wired across multiple files and are not obvious from any single file.
+- If you are about to add support for a new optimizer (CPU/hybrid offload, Muon, FP8) — read [`optimizer_state_model.md`](optimizer_state_model.md) for the state-set contract (param-shaped states, per-state device/dtype, src/dst name match) and the ongoing work in [`../hybrid_adam/`](../hybrid_adam/).
 - If you are about to add a new test or sanity check on ckpts — see the DCP-level tools in [`../../tools/ckpt/`](../../tools/ckpt/) and their README. Do not write yet another ad-hoc comparator.
 - If you are about to add Megatron version compatibility (e.g., 0.17), the patterns from the 0.16 work in [`../megatron_016_adaptation/`](../megatron_016_adaptation/) are the closest precedent.

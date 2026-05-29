@@ -147,6 +147,14 @@ Both asserts share a root cause: the model is built with tied input embedding / 
 
 - **`_copy_main_params_to_model_params` on a re-entered cached strategy.** Symptom is the same `setStorage size 0`, but it fires inside `update_model_weight()` during the **second** reshard back to a previously-used strategy (reproducible with `tp_flip` / `ep_flip` at `interval=3` on 4 GPUs). Root cause: at some point the elastic loop used `model[:] = training_state.model`, a slice-assignment that mutates the model list `ElasticMegatronManager` is aliasing. Every cached `TrainingState.model` then points at the dst strategy's DDP wrappers, while the cached `TrainingState.optimizer.buffers` still references the original strategy's buffers — the two diverge, storages stop matching, `_copy_main_params_to_model_params` reads a storage that was zero'd out. **Fix:** keep the elastic loop as plain rebind (`model = training_state.model`); see [invariants.md](invariants.md) I-6. If the symptom returns under rebind, `git log` the `train()` loop for an accidentally-reintroduced slice-assignment.
 
+### Symptom F — optimizer state-set mismatch / CPU-state transport (new-optimizer work)
+
+Only relevant when adding a non-Adam or offloaded optimizer (see [`optimizer_state_model.md`](optimizer_state_model.md), [invariants.md](invariants.md) I-15).
+
+- **`AssertionError: ... is not param-shaped` in `OptimizerTensorInfo.__post_init__`.** A discovered state tensor has a different `numel` than the master (e.g. an FP8 per-block scale, or a per-param scalar that slipped past the `ordered_optimizer_state_keys` filter). Non-param-shaped states are unsupported; do not relax the assert — they need a separate transport path.
+- **`AssertionError: src/dst optimizer state set mismatch` in `transfer.py::_main_process`.** src and dst enumerated different state names for the same param. Usually the DST offload schema (`init_empty_state_dict`) does not match what the initialized SRC produces (`ordered_optimizer_state_keys`). Make the offload schema mirror the SRC keys/order.
+- **NCCL hang with no assert, on a reshard involving CPU-resident states.** If `_main_process` holds only one side on a rank the state-name mismatch is not caught locally and instead desyncs send/recv counts. Cross-check `state_names` length across ranks; confirm the CPU staging path in `communicator.py` (Symptom C triage applies).
+
 ---
 
 ## General probe-site cheat-sheet
