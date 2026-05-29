@@ -131,9 +131,11 @@ def compare(a_dir: str, b_dir: str, thresh: float = 1e-3, include_optim_buffers:
             mismatched += 1
         else:
             matched += 1
+        # `del` lets the caching allocator reuse these blocks for the next key.
+        # Do NOT call torch.cuda.empty_cache() here: per-key empty_cache forces a
+        # full device sync + cache teardown every iteration and dominates runtime
+        # for checkpoints with many keys (numerically a no-op).
         del va_f, vb_f, diff
-        if device.type == 'cuda':
-            torch.cuda.empty_cache()
 
     # Optim flat buffers: shape 在不同 DP/EP 下不同,无法逐 element 对比。这里只看
     # 整体 sum / L2 作为 sanity check —— 真正的 logical multiset 比较请用
