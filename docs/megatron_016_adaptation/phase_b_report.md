@@ -31,7 +31,7 @@ This report summarises the ckpt-level and loss-level verification we ran on 8 GP
 | `moe_mix_full` | 8 | EP / CP / TP / PP sweep, includes EP=1 ↔ EP>1 transitions |
 | `moe_cp_only` | 3 | EP=2 fixed, sweep CP=1/2/4 |
 
-The `_mk` helper now takes `cp` and `dgz` (`num_distributed_optimizer_instances`) parameters. **Group-Zero (`dgz>1`) switching is not supported at fixed `world_size`** (`is_redundant_backup` requires `world_size` to change, i.e. scale up/down); deferred to a separate issue.
+The `_mk` helper now takes `cp` and `dgz` (`num_distributed_optimizer_instances`) parameters. **Group-Zero (`dgz>1`) switching is not supported at fixed `world_size`.** `is_redundant_backup` is selected **only** when `src.num_distributed_optimizer_instances != dst.num_distributed_optimizer_instances` (i.e. the test is explicitly turning DGZ on/off); the current code further requires `src_world_size != dst_world_size` for that flip. Plain reshards across TP/PP/CP/EP/world_size **do not** touch `is_redundant_backup` at all — they go through `transfer_params`. Deferred to a separate issue.
 
 A new `ELASTIC_SAVE_CKPT=1` env-var hook (in `training.py::train`'s main loop) passes `save_ckpt=True` into `elastic_megatron_manager.reshard()`, so we get before/after-reshard ckpts saved to `tools/ckpt/{before,after}_reshard/iter_<N>/` for offline verification.
 
@@ -168,18 +168,18 @@ To make reshard fully `|Δ|=0` would require:
 
 ## 4. Known transitions outside Phase B's coverage (separate issue)
 
-**Group-Zero (`num_distributed_optimizer_instances > 1`) switching.** The `is_redundant_backup` path (around `elastic_megatron/megatron_manager/parallel_strategy.py:280`) requires `src_world_size != dst_world_size` — designed for scale up/down. DGZ switching at fixed `world_size` is not supported. Will be fixed if/when actually needed.
+**Group-Zero (`num_distributed_optimizer_instances > 1`) switching.** The `is_redundant_backup` path (around `elastic_megatron/megatron_manager/parallel_strategy.py:280`) fires **only** when `src.num_distributed_optimizer_instances != dst.num_distributed_optimizer_instances` — i.e. the test is explicitly turning DGZ on or off across the reshard. The current implementation additionally requires `src_world_size != dst_world_size`, which is the scale-up/down scenario it was built for; DGZ flips at a fixed `world_size` are unsupported. Plain reshards across TP / PP / CP / EP / world_size never enter this path — they go through `transfer_params`. Will be fixed if/when DGZ-flip is actually needed.
 
 ---
 
-## 4a. Eval-time `setStorage` / `do_test` bug fix (2026-05-18 follow-up)
+## 4a. Eval-time `setStorage` / `do_test` bug fix (2026-05-18 follow-up; Bug A REVERTED 2026-05-26)
 
-Phase B set all runners to `--eval-iters 0` for speed. The follow-up makes eval work end-to-end (it's required in real deployments). Two related bugs were fixed; see [`changelog.md`](changelog.md) "Eval-time setStorage / do_test bug" for the full write-up:
+Phase B set all runners to `--eval-iters 0` for speed. The 2026-05-18 follow-up tried to make eval work end-to-end. Two related bugs were addressed; see [`changelog.md`](changelog.md) "Eval-time setStorage / do_test bug" for the full write-up:
 
-- **Bug A.** The elastic loop in `train()` did `model = training_state.model`, only rebinding the local variable. `pretrain()`'s reference to the model list still pointed at the (now released) initial model → final eval crashed with `setStorage size 0`. Fix: slice-assignment, `model[:] = training_state.model`, mutates the list in place.
-- **Bug B.** `build_iterators` unconditionally set `args.do_test = eval_iters > 0`. With `--split 98,2,0` the test iterator is `None` but `do_test=True` → final test eval trips `assert data_iterator is not None`. Fix: mirror mcore's original semantics — decide `do_*` from iterator presence, then `all_reduce(MAX)` to sync across ranks.
+- **Bug A (fix reverted 2026-05-26).** The elastic loop in `train()` did `model = training_state.model`, only rebinding the local variable. `pretrain()`'s reference to the model list still pointed at the (now released) initial model → final eval crashed with `setStorage size 0`. The 2026-05-18 attempt was slice-assignment (`model[:] = training_state.model`), mutating the list in place. **That fix was reverted on 2026-05-26** because the list `pretrain()` holds is the same object `ElasticMegatronManager` stores in every cached `TrainingState.model`; the in-place mutation poisoned all cache slots and broke any reshard that revisits a strategy (`tp_flip`, `ep_flip`, `dense_mix`, `moe_mix`). The current convention is: keep plain rebind, and disable end-of-train eval / `--save` in the launcher scripts. See [`changelog.md`](changelog.md) "Revert `model[:]` slice-assignment" and [`../project/invariants.md`](../project/invariants.md) I-6.
+- **Bug B (fix still in effect).** `build_iterators` unconditionally set `args.do_test = eval_iters > 0`. With `--split 98,2,0` the test iterator is `None` but `do_test=True` → final test eval trips `assert data_iterator is not None`. Fix: mirror mcore's original semantics — decide `do_*` from iterator presence, then `all_reduce(MAX)` to sync across ranks. (This is independent of the `model[:]` story and remains correct.)
 
-Verification: dense_mix + moe_mix × 2 splits × `EVAL_ITERS=2 EVAL_INTERVAL=3` — all combinations run periodic eval + final valid + (when applicable) final test successfully, with no `setStorage` and no `AssertionError`.
+Original 2026-05-18 verification (dense_mix + moe_mix × 2 splits × `EVAL_ITERS=2 EVAL_INTERVAL=3` running periodic eval + final valid + final test) is no longer the current state — under the 2026-05-26 convention, end-of-train eval/save is disabled. 2026-05-26 verification covers reshard correctness with `EVAL_ITERS=0`: `dense_mix` / `moe_mix` (4-GPU) loss converges; `dense_mix_full` / `moe_mix_full` (8-GPU) 8/8 weight + 8/8 optim ckpt-level bit-equal; `tp4_dp_flip` (TP=4/DP=2 ↔ TP=4/DP=1, scale down) loss converges.
 
 ---
 

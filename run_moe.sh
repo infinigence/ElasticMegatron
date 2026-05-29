@@ -8,7 +8,8 @@ export PYTHONHASHSEED=1234
 export TORCH_MANUAL_SEED=1234
 BASE_PATH=${BASE_PATH:-/workspace}
 MEGATRON_PATH=${MEGATRON_PATH:?'MEGATRON_PATH is not set. Set it to your Megatron-LM directory.'}
-export PYTHONPATH=${BASE_PATH}/ElasticMegatron:${MEGATRON_PATH}
+_SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+export PYTHONPATH=${PYTHONPATH:-${_SCRIPT_DIR}:${MEGATRON_PATH}}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 # Short NCCL timeout (60s) so hangs surface quickly during debugging.
 # Bump this for long real runs.

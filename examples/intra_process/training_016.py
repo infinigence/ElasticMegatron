@@ -2587,16 +2587,14 @@ def train(
                 if training_state is not None:
                     if not elastic_is_running:
                         timers('interval-time', log_level=0).start(barrier=False)
-                    # IMPORTANT: 用 slice assignment 原地更新 model list 的内容,而不是
-                    # `model = training_state.model`(那只重新绑定 train() 的局部变量,
-                    # pretrain() 持有的 model list 引用仍指向初代 model —— 该 model 的
-                    # DDP buffer 已被 reshard 时的 release_model() resize 到 0,
-                    # pretrain() 末尾的 final eval / save_checkpoint 会立刻
-                    # `setStorage: out of bounds for storage of size 0`)。
-                    # slice assignment 后,两侧的 model list 引用同一对象、内容为
-                    # 当前 training_state 的 dst model chunks(它们已被
-                    # update_model_weight() 重新填充)。
-                    model[:] = training_state.model
+                    # NOTE: rebind only (写法 A). pretrain() retains the original model list,
+                    # whose DDP buffer storage may have been resize(0)'d by release_model().
+                    # As a result, pretrain()'s post-train evaluate_and_print_results /
+                    # save_checkpoint will trip `setStorage: storage of size 0` unless
+                    # --eval-iters=0 (and save is disabled), which is the smoke-test default.
+                    # If eval/save is needed, swap back to `model[:] = training_state.model`
+                    # but also break the list aliasing in TrainingState.__init__ (use list(model)).
+                    model = training_state.model
                     optimizer = training_state.optimizer
                     opt_param_scheduler = training_state.opt_param_scheduler
                     (

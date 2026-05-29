@@ -30,7 +30,7 @@ The bulk of the integration:
 - `init_parallel_strategy_list()` — builds the list of `(parallel_strategy, ...)` candidates from `ELASTIC_STRATEGY_MODE` env var. Phase B adds 4 8-GPU modes: `dense_mix_full`, `dense_cp_only`, `moe_mix_full`, `moe_cp_only`.
 - `check_reshard(iteration)` — picks the next strategy when `iteration % ELASTIC_RESHARD_INTERVAL == 0`.
 - `init_elastic_megatron_manager()` — wires the strategy list into `ElasticMegatronManager`.
-- The elastic loop inside `train()` — the `if elastic_megatron_manager: ...` block, using `model[:] = training_state.model` slice-assignment (see [`invariants.md`](invariants.md) I-6).
+- The elastic loop inside `train()` — the `if elastic_megatron_manager: ...` block, using plain rebind `model = training_state.model` (see [`invariants.md`](invariants.md) I-6). The launcher must run with `--eval-iters 0` and no `--save` under this convention.
 - `ELASTIC_SAVE_CKPT=1` hook — passes `save_ckpt=True` to `reshard()` so before/after ckpts land in `tools/ckpt/{before,after}_reshard/iter_N/`.
 - `ElasticMegatronManager.register(...)` at the top of `pretrain()`.
 

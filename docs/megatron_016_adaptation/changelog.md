@@ -4,13 +4,107 @@ Organised by topic, in reverse-chronological order. Each entry describes one coh
 
 ---
 
-## Eval-time `setStorage` / `do_test` bug (2026-05-18)
+## PP=1 + tied input embedding / output layer reshard fix (2026-05-28)
+
+**Scope.** `elastic_megatron/resharding/resharding_dp.py`, `elastic_megatron/resharding/virtual_param.py`, `run_e2e_demo.sh`.
+
+When the model is built with tied input embedding / output layer (i.e. without `--untie-embeddings-and-output-weights`) **and** the active strategy has `pipeline_model_parallel_size == 1`, reshard fails on the very first transition with `AssertionError: dp_distribution is not None` ([virtual_param.py:168](../../elastic_megatron/resharding/virtual_param.py)) or, after partially fixing that, with `AssertionError: is_contain` inside the optimizer-tensor transfer.
+
+The bug is two layered mismatches between ElasticMegatron's simulation and Megatron's actual run; both must be fixed.
+
+### Layer 1 — simulated DDP bucket layout disagrees with real run at PP=1
+
+Megatron's [`_does_param_require_new_bucket`](../../../Megatron-LM-custom/megatron/core/distributed/param_and_grad_buffer.py) splits any param whose `shared_embedding` attribute is `True` into its own bucket (only when `use_distributed_optimizer=True`). The attribute is set on the **real** param by [`LanguageModule.setup_embeddings_and_output_layer`](../../../Megatron-LM-custom/megatron/core/models/common/language_module/language_module.py) — *but only when PP>1*. At PP=1 that method early-returns at the `if self.config.pipeline_model_parallel_size == 1` check (line 268), so the real param has no `shared_embedding` attr, `_does_param_require_new_bucket` returns False, and the real run uses **one big bucket** even with tied embeddings.
+
+ElasticMegatron's `VirtualParam` ([virtual_param.py:513, :601](../../elastic_megatron/resharding/virtual_param.py)) carries `shared_embedding=share_embeddings_and_output_weights` *unconditionally*, because the flag is also a model-level descriptor used by other code paths (e.g. [`transfer.py`](../../elastic_megatron/transfer/transfer.py)'s orphan guard). When `get_params_dp_distribution` hands those VirtualParams to Megatron's `_ParamAndGradBuffer` for bucket-layout simulation at PP=1, Megatron splits WORD_EMBEDDING into its own bucket — *the simulated layout no longer matches the real run*. The simulated dp_distribution then claims a full-half slice for WORD_EMBEDDING while the real distributed optimizer only owns a tail-fragment slice. The mismatch surfaces as `transfer.py`'s `is_contain` assert during the ZeRO-1 gather.
+
+**Fix.** Mask `VirtualParam.shared_embedding` to `False` *only* while running the PP=1 bucket-layout simulation, then restore. Implemented as a contextmanager [`_mask_shared_embedding_for_pp1`](../../elastic_megatron/resharding/resharding_dp.py) wrapping the `get_ddp_buffer_distribution` call inside `get_params_dp_distribution`. Other call sites that read `virtual_param.shared_embedding` (notably [`transfer.py:323-329`](../../elastic_megatron/transfer/transfer.py) skipping the orphan OUTPUT_LAYER) are untouched. At PP>1 the contextmanager is a no-op.
+
+### Layer 2 — orphan tied OUTPUT_LAYER triggers `get_dp_distribution` assert in the reshard-plan loop
+
+At PP=1 + tied, the OUTPUT_LAYER `VirtualParam` is an orphan — it shares storage with WORD_EMBEDDING and `_get_non_transformer_layer_stage_id` ([resharding_pp.py:110](../../elastic_megatron/resharding/resharding_pp.py)) returns -1 for it. [`_build_stages_virtual_params`](../../elastic_megatron/resharding/virtual_param.py) already filters orphans out (line 322), so their `_dp_distribution_cache` is empty by construction. But [`register_reshard`](../../elastic_megatron/resharding/virtual_param.py) iterated `self.all_virtual_params` unconditionally, calling `apply_reshard_plan` → `_generate_reshard_plan` → `get_dp_distribution` on the orphan — and that trips the `assert dp_distribution is not None` at [virtual_param.py:168](../../elastic_megatron/resharding/virtual_param.py).
+
+The orphan is already correctly excluded from `transfer.transfer_optimizer_tensors` ([transfer.py:317-329](../../elastic_megatron/transfer/transfer.py)) and from `_build_stages_virtual_params`. The reshard-plan loop was the only remaining site that did not honour the orphan filter.
+
+**Fix.** Add `VirtualParam.is_orphan_for(src_pp_size, dst_pp_size)` ([virtual_param.py](../../elastic_megatron/resharding/virtual_param.py)) — true iff the VP has `stage_id=-1` on both sides. `register_reshard` skips `apply_reshard_plan` for orphans. Downstream transfer is already a no-op for them, so the data flow stays consistent.
+
+### Why both layers must be fixed
+
+Verified by applying only one fix at a time on a clean tree:
+
+- **Fix #2 alone (skip orphan in `register_reshard`)**: the `dp_distribution is not None` assert disappears, but the simulated WORD_EMBEDDING bucket layout (Layer 1) still disagrees with the real run → transfer trips `is_contain` instead.
+- **Fix #1 alone (mask `shared_embedding` for PP=1 sim)**: the bucket layout matches, but the orphan OUTPUT_LAYER still gets fed into `apply_reshard_plan` → `dp_distribution is not None` fires.
+
+Both fixes are required and cover orthogonal failure modes.
+
+### Files touched
+
+- `elastic_megatron/resharding/resharding_dp.py` — added `_mask_shared_embedding_for_pp1` contextmanager; `get_params_dp_distribution` now wraps the dense-bucket simulation in it.
+- `elastic_megatron/resharding/virtual_param.py` — added `VirtualParam.is_orphan_for`; `VirtualParamSpace.register_reshard` skips orphans.
+- `run_e2e_demo.sh` — new `TIE_EMBED=1` env var to swap `--untie-embeddings-and-output-weights` for the tied path, so the regression can be exercised without editing the script.
+
+### Verification (2026-05-28)
+
+- **Reproducer on un-fixed clean tree.** 4-GPU `tp_flip` with `TIE_EMBED=1 TP=1 PP=1 ELASTIC_RESHARD_INTERVAL=3`: fails at iter 3 with `assert dp_distribution is not None` (virtual_param.py:168).
+- **With Fix #2 only**: passes the `dp_distribution` assert, fails later with `is_contain` inside the transfer.
+- **With both fixes**: 15 iter / 4 reshards complete, loss converges 10.38 → 10.20.
+- **Regression (default `dense_mix`, untied)**: 8 iter / 2 reshards, loss converges 10.38 → 10.22 — no impact on the existing path.
+
+### What this fix does not do
+
+- Does not change `VirtualParam.shared_embedding`'s default semantics. The flag remains a model-level descriptor (used by `transfer.py`'s orphan guard) and is only ever masked transiently inside the PP=1 bucket simulation.
+- Does not add ckpt-level verification for the tied+PP=1 path; long-run loss + the existing assert-driven safety nets are the current evidence. A dedicated `tied_tp_flip` sweep mode is a natural follow-up.
+
+---
+
+## Revert `model[:]` slice-assignment; eval/save stays disabled by default (2026-05-26)
+
+**Scope.** `Megatron-LM-custom/megatron/training/training.py` elastic loop, `examples/intra_process/training_016.py` snapshot, `run_e2e_demo.sh` / `run_moe.sh` (PYTHONPATH self-import).
+
+**What changed.** The elastic loop now uses plain rebind:
+
+```python
+model = training_state.model        # rebind (写法 A)
+# model[:] = training_state.model   # ← removed (the 2026-05-18 fix)
+```
+
+**Why.** The 2026-05-18 fix (Bug A below) replaced `model = ...` with `model[:] = ...` to keep `pretrain()`'s reference live for the post-train eval. That removed the eval-time crash, but introduced a regression that is silent under Phase B (each strategy is visited once) and loud under `tp_flip` / `ep_flip` (strategies are revisited):
+
+- `ElasticMegatronManager.__init__` → `TrainingState.__init__` stores `self.model = model` (no copy). Every cached `TrainingState` keyed by parallel strategy ends up holding the **same list reference** as `pretrain()`.
+- `model[:] = training_state.model` mutates that list in place → every cached `TrainingState.model` is overwritten with the dst strategy's DDP wrappers at once.
+- The next reshard back to a previously-used strategy finds its cached `TrainingState.model` no longer matches `TrainingState.optimizer.buffers` (the optimizer still references the original-strategy buffers). `update_model_weight()` → `_copy_main_params_to_model_params()` reads a `param_data` whose `untyped_storage().size() == 0` and fails with `setStorage size 0`.
+
+**Reproducer.** 4-GPU `dense_mix` (`tp_flip`) or `moe_mix` (`ep_flip`) with `ELASTIC_RESHARD_INTERVAL=3`: first reshard succeeds, second reshard (back to the initial strategy) blows up at `update_model_weight`.
+
+**Current convention.** Use plain rebind everywhere; the launcher scripts (`run_e2e_demo.sh` / `run_moe.sh` / `run_experiment.sh`) already default `--eval-iters 0` and emit no `--save`, so `pretrain()`'s post-train eval / save path never touches the stale model list. This is the cheapest workaround; the slice-assignment fix is documented in [`../project/invariants.md`](../project/invariants.md) I-6 as a non-default option that additionally requires breaking the list aliasing in `TrainingState.__init__` (e.g. `self.model = list(model)`) before re-enabling.
+
+**Verification (2026-05-26).** All five with rebind + `EVAL_ITERS=0`:
+
+| Test | GPUs | Reshards | Weight pass | Optim pass |
+|---|---|---|---|---|
+| `dense_mix` (tp_flip) | 4 | 4 | (loss converges) | — |
+| `moe_mix` (ep_flip) | 4 | 4 | (loss converges) | — |
+| `dense_mix_full` | 8 | 8 | **8/8** | **8/8** |
+| `moe_mix_full` | 8 | 8 | **8/8** | **8/8** |
+| `tp4_dp_flip` (TP=4/DP=2 ↔ TP=4/DP=1, scale down) | 8 | 4 | (loss converges) | — |
+
+**Files touched.**
+
+- `Megatron-LM-custom/megatron/training/training.py` — `model[:] = ...` → `model = ...`; also added `tp4_dp_flip` mode in `init_parallel_strategy_list`.
+- `examples/intra_process/training_016.py` — sync snapshot.
+- `run_e2e_demo.sh` / `run_moe.sh` — PYTHONPATH defaults to script's own dir (was `${BASE_PATH}/ElasticMegatron`), so a clone in a non-standard path tests itself rather than a sibling tree.
+
+---
+
+## (Superseded) Eval-time `setStorage` / `do_test` bug (2026-05-18)
+
+> **Status:** Bug A's slice-assignment fix below was **reverted** on 2026-05-26 (see entry above) — under the current convention the launcher disables end-of-train eval/save instead. Bug B (`do_test` derivation) and Bug C (script env overrides) remain in effect.
 
 **Scope.** `Megatron-LM-custom/megatron/training/training.py`, `elastic_megatron/megatron_manager/dataloader_state.py`, `run_e2e_demo.sh` / `run_moe.sh` / `run_experiment.sh`.
 
 The earlier Phase B configuration disabled eval (`--eval-iters 0`) in every runner so demos would finish quickly (see [`phase_b_report.md`](phase_b_report.md) §4a). This change makes eval work end-to-end when actually enabled.
 
-### Bug A — final eval `setStorage size 0` (fixed)
+### Bug A — final eval `setStorage size 0` (fix REVERTED 2026-05-26; eval is now disabled instead)
 
 [`Megatron-LM-custom/megatron/training/training.py`](../../../Megatron-LM-custom/megatron/training/training.py)
 
@@ -31,13 +125,13 @@ model = training_state.model
 
 This only rebinds the *local* variable in `train()` — `pretrain()`'s reference to the original `model` list still points at the very first model (which may be the src of some past reshard, with already-released buffers). `pretrain()`'s final `evaluate_and_print_results` uses that stale model, and the embedding view explodes.
 
-**Fix.** Slice-assignment, mutating the list **in place**:
+**Fix (REVERTED on 2026-05-26).** The 2026-05-18 fix was slice-assignment, mutating the list **in place**:
 
 ```python
-model[:] = training_state.model
+model[:] = training_state.model  # 2026-05-18 fix, reverted 2026-05-26
 ```
 
-`pretrain()`'s reference now sees the same list, with its contents updated to the current dst model chunks (whose storage was repopulated by `update_model_weight()`).
+This regressed any reshard that revisits a cached strategy (the `model` list is aliased by every cached `TrainingState`). See the "Revert `model[:]` slice-assignment" entry at the top of this file for the analysis. The current convention is plain rebind plus `--eval-iters 0` / no `--save` in the launcher scripts.
 
 ### Bug B — `args.do_test=True` but `test_data_iterator=None` (fixed)
 
@@ -80,7 +174,7 @@ args.do_test  = args.eval_iters > 0
 
 ### Files touched
 
-- `Megatron-LM-custom/megatron/training/training.py` — `model[:] = training_state.model`
+- `Megatron-LM-custom/megatron/training/training.py` — `model[:] = training_state.model` (REVERTED 2026-05-26; now plain `model = training_state.model`)
 - `elastic_megatron/megatron_manager/dataloader_state.py::build_iterators` — `do_*` derived from iterator state + `all_reduce(MAX)` sync
 - `run_e2e_demo.sh` — `--eval-interval ${EVAL_INTERVAL:-10000} --eval-iters ${EVAL_ITERS:-0}`
 - `run_moe.sh` — same
@@ -107,7 +201,7 @@ Phase 4 (below) fixed the `save_checkpoint(..., optimizers[0], ...)` bug. Phase 
 
 **Excluded** (separate issue, not in Phase B scope):
 
-- **Group-Zero** (`num_distributed_optimizer_instances > 1`). `is_redundant_backup` requires `world_size` to change (scale up/down); at fixed `world_size`, DGZ switching is not supported.
+- **Group-Zero** (`num_distributed_optimizer_instances > 1`). Plain reshards do NOT exercise `is_redundant_backup` / `transfer_manager.redundant_backup` — those paths are entered **only** when `src.num_distributed_optimizer_instances != dst.num_distributed_optimizer_instances` (you are explicitly turning DGZ on or off across the reshard). And even then the current code further requires `src_world_size != dst_world_size`, so DGZ flips at a fixed `world_size` are unsupported. (Earlier notes in this repo occasionally suggested "scale up/down ⇒ redundant_backup" — that is wrong; world-size changes alone go through `transfer_params`. See [`../project/invariants.md`](../project/invariants.md) I-9.)
 
 ### Side-fix in Phase B: EP=1 ↔ EP>1 step synchronization
 

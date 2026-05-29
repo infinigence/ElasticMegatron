@@ -362,6 +362,43 @@ def get_ddp_buffer_distribution(
     return transpose_and_sort_dp_distribution(dp_to_params_distribution, params)
 
 
+@contextmanager
+def _mask_shared_embedding_for_pp1(
+    dense_params: list["VirtualParam"], pipeline_model_parallel_size: int
+):
+    """Temporarily clear ``VirtualParam.shared_embedding`` while PP=1.
+
+    Why this exists: Megatron's ``_does_param_require_new_bucket`` (in
+    ``megatron/core/distributed/param_and_grad_buffer.py``) splits any param
+    with ``shared_embedding=True`` into its own bucket. At PP>1, Megatron sets
+    ``weight.shared_embedding = True`` for the duplicated embedding so that
+    bucket happens; at PP=1, ``LanguageModule.setup_embeddings_and_output_layer``
+    early-returns and the attribute is never set on the real param — so the
+    real run uses ONE big bucket even with tied embeddings.
+
+    ElasticMegatron's VirtualParam (see virtual_param.py:513, :601) carries
+    ``shared_embedding=share_embeddings_and_output_weights`` unconditionally,
+    because the flag is a model-level descriptor used by other paths
+    (e.g. transfer.py's orphan guard) that need it regardless of PP. So when
+    we hand VirtualParams to Megatron's ``_ParamAndGradBuffer`` for bucket
+    layout simulation at PP=1, we must mask the flag — otherwise the simulated
+    layout splits WORD_EMBEDDING into its own bucket while the real layout
+    does not, and downstream dp_distribution / transfer plans go off by a
+    fragment range (``is_contain`` assert in transfer.py).
+    """
+    if pipeline_model_parallel_size != 1:
+        yield
+        return
+    saved = {vp: vp.shared_embedding for vp in dense_params if vp.shared_embedding}
+    for vp in saved:
+        vp.shared_embedding = False
+    try:
+        yield
+    finally:
+        for vp, prev in saved.items():
+            vp.shared_embedding = prev
+
+
 def get_params_dp_distribution(
     params: list["VirtualParam"],
     parallel_strategy: ParallelStrategy,
@@ -401,11 +438,14 @@ def get_params_dp_distribution(
         else:
             dense_params.append(param)
 
-    dense_params_dp_distribution: dict[VirtualParam, dict[int, Range]] = (
-        get_ddp_buffer_distribution(
-            dense_params, data_parallel_size, ddp_config, bucket_size
+    with _mask_shared_embedding_for_pp1(
+        dense_params, parallel_strategy.pipeline_model_parallel_size
+    ):
+        dense_params_dp_distribution: dict[VirtualParam, dict[int, Range]] = (
+            get_ddp_buffer_distribution(
+                dense_params, data_parallel_size, ddp_config, bucket_size
+            )
         )
-    )
 
     if moe_params_dict:
         # Get param dp distribution in EP-Rank0

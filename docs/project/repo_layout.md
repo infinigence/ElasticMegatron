@@ -74,7 +74,7 @@ The library is organised by concern, not by parallelism dimension:
 |---|---|
 | `README.md` | Three patch points to add into Megatron's `megatron/training/training.py` |
 | `training_011.py` | Full snapshot for Megatron-LM 0.11 — drop-in replacement |
-| `training_016.py` | Full snapshot for Megatron-LM 0.16 — drop-in replacement, includes Phase B sweep modes + `ELASTIC_SAVE_CKPT` hook + the `model[:] = training_state.model` slice-assignment fix |
+| `training_016.py` | Full snapshot for Megatron-LM 0.16 — drop-in replacement, includes Phase B sweep modes + `ELASTIC_SAVE_CKPT` hook. Elastic loop uses plain rebind (`model = training_state.model`); launcher must set `--eval-iters 0` and not pass `--save` (see invariants.md I-6). |
 
 ## `tools/`
 

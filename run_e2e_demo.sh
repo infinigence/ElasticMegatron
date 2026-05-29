@@ -6,7 +6,11 @@ export TORCH_MANUAL_SEED=1234
 
 BASE_PATH=${BASE_PATH:-/workspace}
 MEGATRON_PATH=${MEGATRON_PATH:?'MEGATRON_PATH is not set. Set it to your Megatron-LM directory.'}
-export PYTHONPATH=${BASE_PATH}/ElasticMegatron:${MEGATRON_PATH}
+# Default PYTHONPATH to this script's directory (so ElasticMegatron-clean tests
+# import the clean tree, not BASE_PATH/ElasticMegatron). Override by exporting
+# PYTHONPATH before invoking.
+_SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+export PYTHONPATH=${PYTHONPATH:-${_SCRIPT_DIR}:${MEGATRON_PATH}}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
 # Short NCCL timeout (60s) so hangs surface quickly during debugging.
 # Bump this for long real runs.
@@ -45,6 +49,15 @@ fi
 
 DROP_OUT=0.0
 MAX_SEQ_LEN=${MAX_SEQ_LEN:-4096}
+
+# TIE_EMBED=1 enables tied input embedding / output layer (exercises the
+# PP=1 + tied-embed bucket-layout simulation path in resharding_dp.py).
+# Default unties so legacy tests keep their original behaviour.
+if [ "${TIE_EMBED:-0}" = "1" ]; then
+    TIE_EMBED_ARG=""
+else
+    TIE_EMBED_ARG="--untie-embeddings-and-output-weights"
+fi
 MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-${MAX_SEQ_LEN}}
 
 
@@ -92,7 +105,7 @@ NETWORK_SIZE_ARGS=" \
        --swiglu \
        --use-flash-attn \
        --disable-bias-linear \
-       --untie-embeddings-and-output-weights \
+       ${TIE_EMBED_ARG} \
        --use-rotary-position-embeddings \
        --no-masked-softmax-fusion \
        --no-position-embedding \

@@ -11,7 +11,7 @@ How `ElasticMegatronManager.reshard()` actually works inside, end to end. Read [
 │     new_strategy = check_reshard(iteration)                        │
 │     if new_strategy is not None:                                   │
 │       ts = elastic_megatron_manager.reshard(new_strategy)          │
-│       model[:] = ts.model                                          │
+│       model = ts.model        # rebind, see invariants.md I-6      │
 │       optimizer = ts.optimizer                                     │
 │       …                                                            │
 │                                                                    │
@@ -84,8 +84,8 @@ After step 1, both src and dst have *metadata* but no live GPU storage for the m
 
 Two paths, both in [`elastic_manager.py`](../../elastic_megatron/elastic_manager.py):
 
-- **Redundant backup** (`is_redundant_sacle_up is not None`): only used for Group-Zero scale up/down, where `src_world_size != dst_world_size`. Copies the optimizer state to a redundant replica.
-- **Direct transfer** (the common case): `TransferManager` in [`transfer/transfer.py`](../../elastic_megatron/transfer/transfer.py) walks `params_to_resharding_metadata`, for each `VirtualParam` uses its cached `ReshardPlan` (built lazily in `apply_reshard_plan`), and issues NCCL `broadcast_object_list` + p2p sends/recvs over the union world group.
+- **Redundant backup** (`is_redundant_sacle_up is not None`): selected **only** when `src.num_distributed_optimizer_instances != dst.num_distributed_optimizer_instances` — i.e. you are explicitly flipping Group-Zero on or off across the reshard. The current implementation additionally requires `src_world_size != dst_world_size` (the scale-up/down scenario it was designed for). World-size changes by themselves, or any plain TP/PP/CP/EP change, do NOT select this path. See [`invariants.md`](invariants.md) I-9.
+- **Direct transfer** (the common case, including all of TP/PP/CP/EP and world-size scale up/down without DGZ flip): `TransferManager` in [`transfer/transfer.py`](../../elastic_megatron/transfer/transfer.py) walks `params_to_resharding_metadata`, for each `VirtualParam` uses its cached `ReshardPlan` (built lazily in `apply_reshard_plan`), and issues NCCL `broadcast_object_list` + p2p sends/recvs over the union world group.
 
 Plans are computed at `(src_strategy, dst_strategy, with_ddp)` granularity, cached on the `VirtualParam`. The first reshard between any two strategies pays the planning cost; later reshards in the same direction reuse the cached plan.
 
@@ -120,8 +120,11 @@ Communication info (bytes, time, bandwidth) is logged. If `save_ckpt=True`, save
 ```python
 training_state = elastic_megatron_manager.reshard(new_strategy)
 if training_state is not None:
-    # I-6: mutate model list in place so pretrain()'s reference stays live
-    model[:] = training_state.model
+    # I-6: plain rebind. Cached TrainingStates share the model list reference,
+    # so a `model[:] =` slice-assignment would poison every cache slot at once.
+    # The launcher script must disable end-of-train eval / --save under this
+    # convention (so pretrain()'s post-train path never touches the stale list).
+    model = training_state.model
     optimizer = training_state.optimizer
     opt_param_scheduler = training_state.opt_param_scheduler
 

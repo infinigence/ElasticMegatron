@@ -144,6 +144,22 @@ class VirtualParam:
             pipeline_model_parallel_size
         )
 
+    def is_orphan_for(self, src_pp_size: int, dst_pp_size: int) -> bool:
+        """True if this VP has no stage on either side of the reshard.
+
+        Only the tied OUTPUT_LAYER under PP=1 satisfies this: it shares storage
+        with WORD_EMBEDDING and its stage_id is -1 (see
+        resharding_pp.py::_get_non_transformer_layer_stage_id). _build_stages_virtual_params
+        already filters orphans out, so their _dp_distribution_cache is empty
+        and apply_reshard_plan would trip get_dp_distribution's assert. The
+        downstream transfer layer also skips them (transfer.py shared_embedding
+        guard), so skipping plan generation here is a no-op for actual data flow.
+        """
+        return (
+            self.get_model_param_stage_id(src_pp_size) == -1
+            and self.get_model_param_stage_id(dst_pp_size) == -1
+        )
+
     def set_model_param_range(
         self,
         parallel_strategy: ParallelStrategy,
@@ -405,8 +421,15 @@ class VirtualParamSpace:
         self.build_model_virtual_params(
             dst_megatron_state.parallel_strategy, ddp_config
         )
+        src_pp_size = src_megatron_state.parallel_strategy.pipeline_model_parallel_size
+        dst_pp_size = dst_megatron_state.parallel_strategy.pipeline_model_parallel_size
         for virtual_param in self.all_virtual_params:
             virtual_param.clear_optimizer_tensor_info()
+            # Skip orphan tied OUTPUT_LAYER (only appears for tied+PP=1 on both
+            # sides). It has no dp_distribution and no parameter to transfer;
+            # see VirtualParam.is_orphan_for and transfer.py shared_embedding guard.
+            if virtual_param.is_orphan_for(src_pp_size, dst_pp_size):
+                continue
             virtual_param.apply_reshard_plan(
                 src_megatron_state.parallel_strategy,
                 dst_megatron_state.parallel_strategy,
