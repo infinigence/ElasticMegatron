@@ -50,7 +50,7 @@ The Megatron side is allowed to:
 
 The Megatron side **must**:
 
-- Use slice-assignment when updating `model` in the elastic loop (I-6).
+- Update `model` in the elastic loop with **plain rebind** (`model = training_state.model`), and run the launcher with `--eval-iters 0` and no `--save` (I-6). Do **not** use `model[:] =` slice-assignment — it poisons the cached `TrainingState.model` lists.
 - Re-derive `forward_backward_func` after reshard (PP size may have changed, which selects a different schedule).
 - Re-derive `config = training_state.refresh_config(...)` after reshard.
 
