@@ -113,6 +113,17 @@ TRAINING_ARGS=(
     --seed 1234
 )
 
+# CPU_OFFLOAD=1 builds Megatron's HybridDeviceOptimizer (CPU+GPU mixed optimizer
+# state); requires the precision-aware optimizer code path. OFFLOAD_FRACTION is the
+# fraction of GPU optimizer-state numel pushed to CPU. Default unset → plain GPU Adam.
+if [ "${CPU_OFFLOAD:-0}" = "1" ]; then
+    TRAINING_ARGS+=(
+        --optimizer-cpu-offload
+        --optimizer-offload-fraction ${OFFLOAD_FRACTION:-0.5}
+        --use-precision-aware-optimizer
+    )
+fi
+
 MODEL_PARALLEL_ARGS=(
     --tensor-model-parallel-size ${TP}
     --pipeline-model-parallel-size ${PP}

@@ -126,6 +126,30 @@ REGULATIZATION_ARGS=" \
        --adam-eps 1e-8 \
        "
 
+# CPU_OFFLOAD=1 builds Megatron's HybridDeviceOptimizer (CPU+GPU mixed optimizer
+# state) to exercise the hybrid-adam reshard path. It requires the precision-aware
+# optimizer code path (Megatron asserts this). OFFLOAD_FRACTION is the fraction of
+# GPU optimizer-state numel pushed to CPU. Default unset → plain GPU Adam.
+if [ "${CPU_OFFLOAD:-0}" = "1" ]; then
+    CPU_OFFLOAD_ARGS=" \
+       --optimizer-cpu-offload \
+       --optimizer-offload-fraction ${OFFLOAD_FRACTION:-0.5} \
+       --use-precision-aware-optimizer \
+       "
+else
+    CPU_OFFLOAD_ARGS=""
+fi
+
+# RERUN_MODE: Megatron's rerun_state_machine mode. Default validate_results re-runs
+# each step to check bit-determinism — fundamentally incompatible with mid-training
+# resharding (a reshard changes reduction order / replays a stateful step), so set
+# RERUN_MODE=disabled for elastic runs that sweep many reshards.
+if [ -n "${RERUN_MODE:-}" ]; then
+    RERUN_ARG="--rerun-mode ${RERUN_MODE}"
+else
+    RERUN_ARG=""
+fi
+
 TRAIN_ITERS=${TRAIN_ITERS:-100}
 TRAINING_ARGS=" \
        --micro-batch-size ${MBS} \
@@ -133,6 +157,8 @@ TRAINING_ARGS=" \
        --train-iters ${TRAIN_ITERS} \
        --log-interval 1 \
        --optimizer adam \
+       ${CPU_OFFLOAD_ARGS} \
+       ${RERUN_ARG} \
        --distributed-timeout-minutes 1 \
        "
 
