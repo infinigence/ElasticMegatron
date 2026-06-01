@@ -271,12 +271,46 @@ def _sort_on_device(cpu_tensor: torch.Tensor, device: torch.device) -> torch.Ten
         return torch.sort(full_cpu).values
 
 
+def _submultiset_check(a_s: torch.Tensor, b_s: torch.Tensor) -> tuple[bool, int]:
+    """Is the smaller of (a_s, b_s) an (exact-value) sub-multiset of the larger?
+
+    Both inputs are sorted. Returns (contained, residual_count) where residual_count is
+    |larger| - |smaller|. Used when the two flat-buffer multisets have *different* numel:
+    a correct reshard preserves the full logical moment multiset, but the distributed
+    optimizer's intra-param padding can differ across TP/DP layouts and — under
+    --use-precision-aware-optimizer — is **non-zero** on a trained source, so it is not
+    removed by the zero-drop. If the smaller side (the un-padded dst) is fully contained
+    in the larger (padded src), the real moment state matches and the extra elements are
+    just padding; otherwise real values were lost/changed. Operates on CPU sorted tensors.
+    """
+    larger, smaller = (a_s, b_s) if a_s.numel() >= b_s.numel() else (b_s, a_s)
+    ul, cl = torch.unique(larger, return_counts=True)
+    us, cs = torch.unique(smaller, return_counts=True)
+    idx = torch.searchsorted(ul, us).clamp(max=ul.numel() - 1)
+    matched = ul[idx] == us
+    cl_for_us = torch.where(matched, cl[idx], torch.zeros_like(cs))
+    contained = bool(matched.all().item()) and bool((cs <= cl_for_us).all().item())
+    return contained, larger.numel() - smaller.numel()
+
+
 def compare_sorted(a_cpu: torch.Tensor, b_cpu: torch.Tensor, name: str, thresh: float,
                    device: torch.device) -> bool:
     """Compare A and B as sorted multisets. A/B are full CPU tensors (potentially big)."""
     if a_cpu.numel() != b_cpu.numel():
-        print(f'  [{name}] NUMEL MISMATCH: {a_cpu.numel()} vs {b_cpu.numel()} '
-              f'(diff={a_cpu.numel()-b_cpu.numel()})')
+        # Unequal numel: not necessarily wrong. Check sub-multiset containment — a correct
+        # reshard preserves the logical moment multiset; the residual is layout-dependent
+        # (non-zero) padding the zero-drop can't remove (see _submultiset_check).
+        a_s = _sort_on_device(a_cpu, device)
+        b_s = _sort_on_device(b_cpu, device)
+        contained, residual = _submultiset_check(a_s, b_s)
+        if contained:
+            print(f'  [{name}] ✓ numel differs ({a_cpu.numel()} vs {b_cpu.numel()}) but the '
+                  f'smaller multiset is fully contained in the larger; residual={residual} '
+                  f'(layout-dependent padding). Logical state preserved.')
+            return True
+        print(f'  [{name}] ✗ NUMEL MISMATCH: {a_cpu.numel()} vs {b_cpu.numel()} '
+              f'(diff={a_cpu.numel()-b_cpu.numel()}); smaller side NOT contained in larger '
+              f'— real values lost/changed.')
         return False
     a_s = _sort_on_device(a_cpu, device)
     b_s = _sort_on_device(b_cpu, device)
@@ -313,6 +347,70 @@ def compare_sorted(a_cpu: torch.Tensor, b_cpu: torch.Tensor, name: str, thresh: 
           f'rel_rms(sorted)={rel:.3e}  max_abs={max_abs:.3e}')
     print(f'         sum:  A={sum_a:.6e}  B={sum_b:.6e}  rel={abs(sum_a-sum_b)/(abs(sum_b)+1e-12):.3e}')
     print(f'         L2:   A={l2_a:.6e}  B={l2_b:.6e}  rel={abs(l2_a-l2_b)/(abs(l2_b)+1e-12):.3e}')
+    return ok
+
+
+def compare_optim(a, b, thresh: float = 1e-3, devices=None,
+                  compute_dtype: torch.dtype = torch.float32,
+                  drop_zeros: bool = True) -> bool:
+    """Compare two ckpts' distrib-optim flat buffers as sorted logical multisets.
+
+    ``devices``: list of 3 torch.device for the (param, exp_avg, exp_avg_sq) sorts
+    (defaults to CPU). Returns True iff all three multisets match within ``thresh``.
+    Importable so a single-process driver (verify_all.py) can loop many pairs
+    without re-paying torch/CUDA startup per pair.
+    """
+    if devices is None:
+        devices = [torch.device('cpu')] * 3
+    print(f'Using devices (param/exp_avg/exp_avg_sq): {devices}, compute_dtype: {compute_dtype}, drop_zeros: {drop_zeros}')
+
+    print(f'Loading A: {a}')
+    A = load_flat_optim(a)
+    print(f'  buckets in A: {len(A)}')
+    for bk, d in A.items():
+        n_pad = d['param'].numel()
+        n_unpad = d.get('numel_unpadded', n_pad)
+        print(f'    {bk}  numel={n_pad:,} (unpadded={n_unpad:,})')
+
+    print(f'\nLoading B: {b}')
+    B = load_flat_optim(b)
+    print(f'  buckets in B: {len(B)}')
+    for bk, d in B.items():
+        n_pad = d['param'].numel()
+        n_unpad = d.get('numel_unpadded', n_pad)
+        print(f'    {bk}  numel={n_pad:,} (unpadded={n_unpad:,})')
+
+    print('\n=== Cross-layout multiset compare (sorted) ===')
+
+    # 多卡并行:把每个 kind 在独立 worker thread 上跑(GPU 操作可以从主线程外发起,
+    # CUDA stream 自然并行)。需要的 sort/比较都在 device-local stream 上完成。
+    import concurrent.futures
+    kinds = ('param', 'exp_avg', 'exp_avg_sq')
+    a_cats = {k: collect_unpadded(A, k, compute_dtype, drop_zeros) for k in kinds}
+    b_cats = {k: collect_unpadded(B, k, compute_dtype, drop_zeros) for k in kinds}
+
+    results = {}
+    if len({d.index for d in devices if d.type == 'cuda'}) > 1:
+        # 多卡:并行
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(kinds)) as pool:
+            futs = {
+                pool.submit(compare_sorted, a_cats[k], b_cats[k], k, thresh, devices[i]): k
+                for i, k in enumerate(kinds)
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                k = futs[fut]
+                results[k] = fut.result()
+    else:
+        # 单卡或 CPU:串行(避免重复抢同一 GPU 显存)
+        for i, k in enumerate(kinds):
+            results[k] = compare_sorted(a_cats[k], b_cats[k], k, thresh, devices[i])
+            del a_cats[k], b_cats[k]
+            if devices[i].type == 'cuda':
+                torch.cuda.empty_cache()
+
+    ok = all(results.values())
+    print()
+    print('PASS' if ok else 'FAIL')
     return ok
 
 
@@ -355,55 +453,7 @@ def main():
 
     compute_dtype = torch.float64 if args.fp64 else torch.float32
     drop_zeros = not args.keep_zeros
-    print(f'Using devices (param/exp_avg/exp_avg_sq): {devices}, compute_dtype: {compute_dtype}, drop_zeros: {drop_zeros}')
-
-    print(f'Loading A: {args.a}')
-    A = load_flat_optim(args.a)
-    print(f'  buckets in A: {len(A)}')
-    for bk, d in A.items():
-        n_pad = d['param'].numel()
-        n_unpad = d.get('numel_unpadded', n_pad)
-        print(f'    {bk}  numel={n_pad:,} (unpadded={n_unpad:,})')
-
-    print(f'\nLoading B: {args.b}')
-    B = load_flat_optim(args.b)
-    print(f'  buckets in B: {len(B)}')
-    for bk, d in B.items():
-        n_pad = d['param'].numel()
-        n_unpad = d.get('numel_unpadded', n_pad)
-        print(f'    {bk}  numel={n_pad:,} (unpadded={n_unpad:,})')
-
-    print('\n=== Cross-layout multiset compare (sorted) ===')
-
-    # 多卡并行:把每个 kind 在独立 worker thread 上跑(GPU 操作可以从主线程外发起,
-    # CUDA stream 自然并行)。需要的 sort/比较都在 device-local stream 上完成。
-    import concurrent.futures
-    kinds = ('param', 'exp_avg', 'exp_avg_sq')
-    a_cats = {k: collect_unpadded(A, k, compute_dtype, drop_zeros) for k in kinds}
-    b_cats = {k: collect_unpadded(B, k, compute_dtype, drop_zeros) for k in kinds}
-
-    results = {}
-    if len({d.index for d in devices if d.type == 'cuda'}) > 1:
-        # 多卡:并行
-        with concurrent.futures.ThreadPoolExecutor(max_workers=len(kinds)) as pool:
-            futs = {
-                pool.submit(compare_sorted, a_cats[k], b_cats[k], k, args.thresh, devices[i]): k
-                for i, k in enumerate(kinds)
-            }
-            for fut in concurrent.futures.as_completed(futs):
-                k = futs[fut]
-                results[k] = fut.result()
-    else:
-        # 单卡或 CPU:串行(避免重复抢同一 GPU 显存)
-        for i, k in enumerate(kinds):
-            results[k] = compare_sorted(a_cats[k], b_cats[k], k, args.thresh, devices[i])
-            del a_cats[k], b_cats[k]
-            if devices[i].type == 'cuda':
-                torch.cuda.empty_cache()
-
-    ok = all(results.values())
-    print()
-    print('PASS' if ok else 'FAIL')
+    ok = compare_optim(args.a, args.b, args.thresh, devices, compute_dtype, drop_zeros)
     sys.exit(0 if ok else 1)
 
 

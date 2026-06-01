@@ -47,7 +47,8 @@ The library is organised by concern, not by parallelism dimension:
 | `resharding_tp.py` | TP-axis plan: for each param, who-sends-to-whom across TP ranks. Has `force_unsharded=True` path for the EP=1 expert-as-dense case |
 | `resharding_pp.py` | PP-axis plan: stage→stage param movement. Defines `ParamPositionAttr` |
 | `resharding_dp.py` | DP-axis plan: which DP rank holds which slice. Mocks `_ParamAndGradBuffer.__init__` (via `mock_ddp_buffer_init` + `_FakeTensor`) to predict mcore's bucket layout without allocating |
-| `resharding_metadata.py` | Per-param `OptimizerTensorInfo` (main_weight, exp_avg, exp_avg_sq) + `release/rebuild`; also the master `generate_resharding_metadata()` that walks the model and decides which params are expert vs dense (name-based: `".experts." in name`) |
+| `resharding_metadata.py` | Per-param `OptimizerTensorInfo` — an ordered, variable-length set of named `OptState`s (Adam: master + exp_avg + exp_avg_sq), each param-shaped with its own device/dtype (see [`optimizer_state_model.md`](optimizer_state_model.md)) + `release/rebuild`; also the master `generate_resharding_metadata()` that walks the model and decides which params are expert vs dense (name-based: `".experts." in name`) |
+| `optimizer_adapter.py` | `OptimizerAdapter` (+ `OptState`) — the single seam hiding per-optimizer-implementation details (Float16 / Distributed / precision-aware / HybridDeviceOptimizer): master location, state init, state discovery, master→model copy. `create()` dispatches; new optimizers (FP8) add a subclass + a branch. See [`optimizer_state_model.md`](optimizer_state_model.md) |
 | `virtual_param.py` | `VirtualParam` — per-param state + caches for `dp_distribution` and `reshard_plan` |
 | `util.py` | `Range`, `ParamRange` helpers |
 

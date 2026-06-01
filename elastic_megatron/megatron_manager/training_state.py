@@ -6,13 +6,17 @@ from collections.abc import Callable
 import torch
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
-from megatron.core.optimizer import ChainedOptimizer, MegatronOptimizer
+from megatron.core.optimizer import (
+    ChainedOptimizer,
+    MegatronOptimizer,
+)
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.utils import get_model_config
 from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args, get_timers
 from megatron.training.training import preprocess_common_state_dict
 
+from ..resharding.optimizer_adapter import OptimizerAdapter
 from ..resharding.resharding_metadata import (
     OptimizerTensorInfo,
     generate_resharding_metadata,
@@ -179,16 +183,47 @@ class TrainingState:
         if self.model_offloaded:
             self.rebuild_model()
 
-        # Copy main params to model params
-        if isinstance(self.optimizer, ChainedOptimizer):
-            for optimizer in self.optimizer.chained_optimizers:
-                optimizer._copy_main_params_to_model_params()
-        else:
-            self.optimizer._copy_main_params_to_model_params()
+        # Copy main params to model params. The adapter does the plain
+        # _copy_main_params_to_model_params, and — under --use-precision-aware-optimizer
+        # (required by HybridDeviceOptimizer), where that call is a no-op (the
+        # master->model copy normally happens inside optimizer.step(), which a reshard
+        # never runs) — also the explicit refill of model param_data from the transferred
+        # fp32 master. See docs/hybrid_adam/megatron_hybrid_optimizer.md §6.
+        optimizers = (
+            self.optimizer.chained_optimizers
+            if isinstance(self.optimizer, ChainedOptimizer)
+            else [self.optimizer]
+        )
+        for optimizer in optimizers:
+            OptimizerAdapter.create(optimizer).copy_main_to_model()
 
         args = get_args()
         if not args.use_distributed_optimizer:
             return
+
+        # Clear any stale async param-gather handle before the forced sync. A
+        # re-entered cached model chunk (e.g. reshard back to a previously-used
+        # strategy) can still hold a pending param_gather_handle from before its
+        # release; start_param_sync(force_sync=True) would `.wait()` on it and
+        # deadlock, because the matching all-gather is never re-issued after the
+        # reshard rebuilt the buffers/groups. Resetting to None makes every rank
+        # fall through and issue a FRESH, matched all-gather. (No-op when the handle
+        # is already None, i.e. the non-precision-aware path.) See
+        # docs/hybrid_adam/changelog.md (TP2->TP1 start_param_sync hang).
+        for model_chunk in self.optimizer.model_chunks:
+            for bucket_group in (
+                getattr(model_chunk, "bucket_groups", [])
+                + getattr(model_chunk, "expert_parallel_bucket_groups", [])
+            ):
+                bucket_group.param_gather_handle = None
+                # The shard views in cached_param_buffer_shard_list reference the OLD
+                # param_data storage captured during this chunk's previous active period;
+                # release_model/rebuild_model changed the storage, so they are stale on a
+                # re-entered chunk. Force a rebuild against the current param_data.
+                if getattr(bucket_group, "cached_param_buffer_shard_list", None):
+                    bucket_group.cached_param_buffer_shard_list = [
+                        None
+                    ] * len(bucket_group.cached_param_buffer_shard_list)
 
         # Sync model params in DP-Group
         self.optimizer.update_successful = True
@@ -293,9 +328,19 @@ class TrainingState:
                         buffer.grad_data.zero_()
 
                     if buffer.param_data.untyped_storage().size() == 0:
-                        buffer.param_data.untyped_storage().resize_(
-                            buffer.param_data_size
+                        # Normally release_model recorded param_data_size. Under
+                        # --use-precision-aware-optimizer the freshly-built dst model's
+                        # param_data is already storage-0 at release time (the weights
+                        # are held in the optimizer's master buffer), so the size was
+                        # never recorded — fall back to the buffer's own element count
+                        # (bytes). _copy_main_params_to_model_params (update_model_weight
+                        # step 5.2) then refills it from the transferred master.
+                        param_data_size = getattr(
+                            buffer,
+                            "param_data_size",
+                            buffer.param_data.numel() * buffer.param_data.element_size(),
                         )
+                        buffer.param_data.untyped_storage().resize_(param_data_size)
                         if onload_weight:
                             buffer.param_data.copy_(
                                 buffer.param_data.cpu_data, non_blocking=True

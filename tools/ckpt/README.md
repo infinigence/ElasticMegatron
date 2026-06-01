@@ -38,17 +38,37 @@ python tools/ckpt/compare_optim_logical.py <ckpt_A> <ckpt_B> \
 | `--fp64` | Use fp64 for comparison (default fp32 — the ckpts themselves are fp32). |
 | `--keep-zeros` | Keep zero elements. Default drops them, because `BucketBuilder` inserts intra-param padding zeros whose **count** differs across TP/PP/EP layouts; without dropping, naive multiset comparison fails with `NUMEL MISMATCH`. The script also auto-detects and skips cross-`dp_group_idx` TP replicas by bit-equality check. |
 
-### `verify_all.sh` — batch verification across a sweep
+### `verify_all.py` — batch verification (recommended; single-process, multi-GPU)
 
-For every iteration that appears in both `tools/ckpt/before_reshard/` and `tools/ckpt/after_reshard/`, runs `compare_dcp.py` (weights) + `compare_optim_logical.py` (optim state). Prints a pass/fail summary. Failure details are written to `/tmp/verify_<iter>.log.{weight,optim}`.
+For every iteration in both `before_reshard/` and `after_reshard/`, runs the weight +
+optim comparison. **Imports torch once** and runs the iteration pairs **concurrently across
+GPUs** (one GPU per pair) via a thread pool — avoiding the per-pair `import torch` / CUDA-init
+cost that dominates `verify_all.sh` for small/medium ckpts. Verbose output goes to a log;
+the terminal shows one line per pair + a summary.
 
 ```bash
-# Single GPU
-bash tools/ckpt/verify_all.sh cuda
-
-# Multi-GPU parallel (compare_optim_logical's three kinds across three GPUs)
-DEVICES=0,1,2 bash tools/ckpt/verify_all.sh cuda
+python tools/ckpt/verify_all.py                 # all GPUs, one pair per GPU
+GPUS=0,1,2,3 JOBS=4 python tools/ckpt/verify_all.py --thresh 1e-3
+python tools/ckpt/verify_all.py --before <dir> --after <dir> --log /tmp/v.log
 ```
+
+It reuses `compare_dcp.compare()` and `compare_optim_logical.compare_optim()` directly, so
+pass/fail semantics are identical to the per-process path.
+
+### `verify_all.sh` — batch verification (shell; per-pair parallel)
+
+Same comparisons via separate processes. Each iteration pair is pinned to one GPU and the
+pairs run concurrently (`JOBS`, default = number of GPUs). Failure details in
+`/tmp/verify_<iter>.log.{weight,optim}`.
+
+```bash
+bash tools/ckpt/verify_all.sh cuda                       # auto: all GPUs, one pair each
+GPUS=0,1,2,3 JOBS=4 bash tools/ckpt/verify_all.sh cuda    # limit GPUs / concurrency
+```
+
+> Perf note: `compare_dcp.py` no longer calls `torch.cuda.empty_cache()` per key (that forced
+> a full device sync every iteration and dominated runtime for many-key ckpts); freed blocks
+> are reused by the caching allocator via `del`. Numerically a no-op.
 
 ## Legacy convert-based path
 

@@ -106,8 +106,8 @@ Plans are computed at `(src_strategy, dst_strategy, with_ddp)` granularity, cach
 `dst.update_model_weight()`:
 
 1. `rebuild_model()` — DDP buffer's `param_data` storage is `resize_()`'d back to `param_data_size`.
-2. `optimizer._copy_main_params_to_model_params()` — for every chained optim, copy the fp32 main_param (which step 2 has populated) into the bf16 model param.
-3. `start_param_sync(force_sync=True)` across each model chunk's DP group — ensures all DP replicas see the same model param.
+2. `OptimizerAdapter.create(optim).copy_main_to_model()` for every chained optim — copy the fp32 main_param (which step 2 has populated) into the bf16 model param. For a plain `DistributedOptimizer` this is `_copy_main_params_to_model_params()`; under `--use-precision-aware-optimizer` that call is a no-op, so the precision-aware adapter additionally refills `param_data` from the master explicitly (see `optimizer_adapter.py`, [`../hybrid_adam/`](../hybrid_adam/)).
+3. `start_param_sync(force_sync=True)` across each model chunk's DP group — ensures all DP replicas see the same model param. (Stale `param_gather_handle` / `cached_param_buffer_shard_list` are reset first when re-entering a cached chunk.)
 
 After step 5, dst's model is live and ready to forward.
 

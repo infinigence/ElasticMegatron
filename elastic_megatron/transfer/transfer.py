@@ -200,6 +200,18 @@ class TransferManager:
         """
         reshard_plan: ReshardPlan = virtual_param.reshard_plan
 
+        # Best-effort guard: when this rank holds both sides (self/survival
+        # transfer), the src and dst must carry the same ordered state set —
+        # _send/_recv zip optimizer_tensors positionally. No-op when only one
+        # side is present on this rank. Always holds for Adam (both = 3 states).
+        src_info = virtual_param.src_optimizer_tensor_info
+        dst_info = virtual_param.dst_optimizer_tensor_info
+        if src_info is not None and dst_info is not None:
+            assert src_info.state_names == dst_info.state_names, (
+                f"src/dst optimizer state set mismatch: {src_info.state_names} vs "
+                f"{dst_info.state_names}; heterogeneous state sets are unsupported."
+            )
+
         # Step-1 : Send tensors
         self._send_optimizer_tensors(
             send_transfer_range_dict=reshard_plan.global_send_info.get(self._rank),
