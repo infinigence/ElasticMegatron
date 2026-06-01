@@ -149,7 +149,7 @@ Both asserts share a root cause: the model is built with tied input embedding / 
 
 ### Symptom F — optimizer state-set mismatch / CPU-state transport (new-optimizer work)
 
-Only relevant when adding a non-Adam or offloaded optimizer (see [`optimizer_state_model.md`](optimizer_state_model.md), [invariants.md](invariants.md) I-15).
+Only relevant when adding a non-Adam or offloaded optimizer (see [`optimizer_state_model.md`](optimizer_state_model.md), [invariants.md](invariants.md) I-15). Per-optimizer behaviour (state discovery, offload schema, master→model copy) lives in `OptimizerAdapter` (`resharding/optimizer_adapter.py`) — fix it in the relevant adapter subclass, not at the call sites.
 
 - **`AssertionError: ... is not param-shaped` in `OptimizerTensorInfo.__post_init__`.** A discovered state tensor has a different `numel` than the master (e.g. an FP8 per-block scale, or a per-param scalar that slipped past the `ordered_optimizer_state_keys` filter). Non-param-shaped states are unsupported; do not relax the assert — they need a separate transport path.
 - **`AssertionError: src/dst optimizer state set mismatch` in `transfer.py::_main_process`.** src and dst enumerated different state names for the same param. Usually the DST offload schema (`init_empty_state_dict`) does not match what the initialized SRC produces (`ordered_optimizer_state_keys`). Make the offload schema mirror the SRC keys/order.

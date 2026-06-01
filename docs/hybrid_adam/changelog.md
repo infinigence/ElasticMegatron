@@ -4,6 +4,47 @@ Reverse-chronological. Each entry is one coherent change.
 
 ---
 
+## R.1 — OptimizerAdapter: consolidate per-optimizer branches behind one seam (2026-06-01, refactor)
+
+Pure refactor (no behaviour change), motivated by FP8 being the next optimizer to support.
+After hybrid-adam landed, the "which optimizer implementation is this, and how do I read/write
+its state" logic was scattered across `resharding_metadata.py` (`_is_hybrid_device_optimizer`,
+`get_main_weight`, `init_empty_state_dict`, `ordered_optimizer_state_keys`, and the big
+HDO/precision-aware/distrib branch in `get_optimizer_tensors_by_model_weight`) and
+`training_state.py` (`_precision_aware_copy_main_to_model` + the precision-aware branch in
+`update_model_weight`). Each new optimizer meant touching several `isinstance`/class-name/config
+checks.
+
+These now live behind **`OptimizerAdapter`** (new `resharding/optimizer_adapter.py`), with one
+dispatch point `OptimizerAdapter.create()` and a subclass per implementation difference:
+
+```
+OptimizerAdapter
+├── Float16OptimizerAdapter
+└── DistributedOptimizerAdapter
+    └── PrecisionAwareOptimizerAdapter
+        └── HybridDeviceOptimizerAdapter   # dummy_step init
+```
+
+Interface: `get_main_weight` / `model_param_sub_range` / `ensure_state_initialized` /
+`discover_states` / `copy_main_to_model`. `get_optimizer_tensors_by_model_weight()` is now a thin
+assembly over the adapter; `update_model_weight()` calls `adapter.copy_main_to_model()`. `OptState`
+moved into the adapter module (breaks the import cycle) and is re-exported from
+`resharding_metadata`. The `MODEL_PARAM_TO_OPT_PARAM_INDEX` module-global (float16 index cache) is
+gone — replaced by a per-adapter lazy map + a `WeakKeyDictionary` adapter cache. The DDP buffer
+sync mechanics (`param_gather_handle` / `cached_param_buffer_shard_list` reset + forced
+`start_param_sync`) stay in `training_state` — they belong to DDP, not the optimizer.
+
+**FP8 seam:** an FP8 adapter overrides `discover_states` (non-param-shaped scale/amax still needs a
+separate transport — I-15) + a `create()` branch; no other call site changes.
+
+Verified: `python -c import` (no cycle) + offline unit checks (state-key ordering parity, factory
+dispatch + memoization, class-name HDO detection, Float16 discovery order). Method bodies are
+verbatim moves of the prior branches, so the bit-equal GPU regression net (8-GPU full sweep, with
+and without CPU-adam, weight + optim) is expected to stay green — **to be re-run when GPU frees up.**
+
+---
+
 ## H.8 — 8-GPU full sweep, both with and without CPU-adam (2026-05-29, GPU-verified)
 
 Expanded coverage to a single **8-GPU** `dense_mix_full` run (full TP / PP / CP / DP / Group-Zero

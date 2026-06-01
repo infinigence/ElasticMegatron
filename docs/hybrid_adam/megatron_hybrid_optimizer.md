@@ -101,6 +101,14 @@ itself, the model `param_data` is never written from the transferred master.
 
 ## 5. Implications for ElasticMegatron (where the code touches this)
 
+> **Status (as of changelog R.1).** Everything below is implemented and now lives behind
+> **`OptimizerAdapter`** (`elastic_megatron/resharding/optimizer_adapter.py`), not scattered across
+> call sites. Current locations: state extraction → `PrecisionAwareOptimizerAdapter.discover_states`;
+> fresh-dst init → `HybridDeviceOptimizerAdapter.ensure_state_initialized` (`dummy_step`); master→model
+> refill → `PrecisionAwareOptimizerAdapter.copy_main_to_model` (calls `_precision_aware_copy_main_to_model`).
+> `rebuild_model`'s size fallback stays in `training_state.py`. The file::function refs below are the
+> pre-refactor narrative — chase the adapter for the live code. See [`../project/optimizer_state_model.md`](../project/optimizer_state_model.md).
+
 - **State extraction** (`resharding_metadata.py::get_optimizer_tensors_by_model_weight`): must
   read the master/moments via `_get_main_param_and_optimizer_states` under precision-aware (done
   in H.2), never treat `param_groups[...]` as the master. See [invariants I-15](../project/invariants.md)

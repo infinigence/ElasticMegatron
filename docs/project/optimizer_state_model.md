@@ -42,20 +42,48 @@ states = [ OptState("main_weight", <fp32 master>),
    see I-5). `transfer/transfer.py::_main_process` asserts `src.state_names == dst.state_names`
    when both sides are present on a rank.
 
-## Where states come from
+## Where states come from — the OptimizerAdapter
 
-`get_optimizer_tensors_by_model_weight()` builds the state list two ways:
+**All per-optimizer-implementation specifics live behind one class:
+`OptimizerAdapter` (`elastic_megatron/resharding/optimizer_adapter.py`).** The reshard
+pipeline never inspects the concrete optimizer; `get_optimizer_tensors_by_model_weight()`
+and `training_state.update_model_weight()` just call adapter methods. The single dispatch
+point is `OptimizerAdapter.create(optimizer)`.
 
-- **SRC (initialized optimizer):** discover generically from `optimizer.state[main_weight]`
-  — master + every param-shaped state, in canonical order. No hard-coded key names.
-- **DST (offload, state dict empty):** `init_empty_state_dict()` pre-creates the keys the SRC
-  side will send (today: the Adam moments), storage-0, so the positional transfer lines up.
-  **A non-Adam optimizer needs its own offload schema here** — this is the one place that
-  still encodes "which states exist" for the not-yet-initialized side.
+The adapter answers the four questions that differ per optimizer:
 
-`get_main_weight()` resolves the master from either a `DistributedOptimizer`
-(`model_param_group_index_map` → flat-buffer sub-range) or the non-distributed
-`fp32_from_float16_groups`.
+| Method | What it hides |
+|---|---|
+| `get_main_weight(model_weight)` | where the param-group anchor lives (`DistributedOptimizer.model_param_group_index_map` vs non-distributed `fp32_from_float16_groups`); `None` ⇒ not owned by this optimizer |
+| `model_param_sub_range(...)` | distrib flat-buffer sub-range vs whole-param |
+| `ensure_state_initialized(..., offload)` | how to init a not-yet-stepped optimizer's state — `init_state_fn` / empty Adam placeholders (`init_empty_state_dict`) / HDO `dummy_step` — plus offloading the master |
+| `discover_states(...)` | **SRC**: master + every param-shaped state in canonical order (`ordered_optimizer_state_keys`, no hard-coded names); precision-aware reads via `_get_main_param_and_optimizer_states` |
+| `copy_main_to_model()` | master→model refill after transfer; precision-aware adds the explicit copy `optimizer.step()` would normally do |
+
+Class hierarchy (each subclass = one implementation difference):
+
+```
+OptimizerAdapter
+├── Float16OptimizerAdapter          # non-distributed
+└── DistributedOptimizerAdapter      # standard distrib Adam
+    └── PrecisionAwareOptimizerAdapter   # --use-precision-aware-optimizer
+        └── HybridDeviceOptimizerAdapter # HDO (CPU+GPU offload): dummy_step init
+```
+
+### Adding a new optimizer
+
+This adapter is the **only** extension point. To support a new optimizer:
+
+1. Add a subclass overriding the methods whose behaviour differs (most need only
+   `discover_states` and/or `ensure_state_initialized`).
+2. Add one branch to `OptimizerAdapter.create()`.
+
+No call site in `resharding_metadata.py` / `training_state.py` / `transfer/` changes.
+
+**FP8 (the next target) hits the param-shaped wall.** Its per-block `scale`/`amax` are
+*not* param-shaped, which `OptimizerTensorInfo` rejects (invariant I-15). An FP8 adapter
+would override `discover_states` to carry those states **and** needs a separate transport
+(see *Out of scope* below) — the adapter is where that seam belongs.
 
 ### HybridDeviceOptimizer (CPU+GPU offload)
 
@@ -69,13 +97,14 @@ CPU-offloaded params live on pinned CPU memory** — handled by per-state device
   the master, not a separate state — excluded via `_NON_TRANSFER_STATE_KEYS`.
 - HDO's `.state` is a synced view and `init_state_fn` is `None`; the not-initialized DST path
   calls `HDO.dummy_step()` to allocate real sub-optimizer state instead of
-  `init_empty_state_dict`. Enabled in launchers with `CPU_OFFLOAD=1` (needs
-  `--use-precision-aware-optimizer`). Status + assumptions: [`../hybrid_adam/`](../hybrid_adam/).
+  `init_empty_state_dict` (`HybridDeviceOptimizerAdapter.ensure_state_initialized`). Enabled in
+  launchers with `CPU_OFFLOAD=1` (needs `--use-precision-aware-optimizer`). Status + assumptions:
+  [`../hybrid_adam/`](../hybrid_adam/).
 - **`--use-precision-aware-optimizer` changes the layout**: `param_groups` holds the bf16/fp16
   shard (not the fp32 master), and the master + moments live in optimizer state. Read them via
   Megatron's `DistributedOptimizer._get_main_param_and_optimizer_states(model_param)` →
-  `{"param", "exp_avg", "exp_avg_sq"}` (what `get_optimizer_tensors_by_model_weight` does when
-  precision-aware is on), **never** by treating `param_groups[...]` as the master.
+  `{"param", "exp_avg", "exp_avg_sq"}` (what `PrecisionAwareOptimizerAdapter.discover_states`
+  does), **never** by treating `param_groups[...]` as the master.
 
 ## Out of scope (guarded, not handled)
 

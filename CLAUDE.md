@@ -81,8 +81,10 @@ These are wired across multiple files and fail in confusing places if broken:
   plain TP/PP/CP/EP/world-size change. Non-DGZ reshards never touch that path.
 - **I-15 — optimizer state is a variable-length set of *param-shaped* named states**, each with its
   own device/dtype; the reshard plan is computed once per param and reused for all states. Adding a
-  new optimizer? Read `docs/project/optimizer_state_model.md` first. Non-param-shaped states (FP8
-  scales) are unsupported (guarded by assert).
+  new optimizer? All implementation specifics live behind `OptimizerAdapter`
+  (`resharding/optimizer_adapter.py`) — add a subclass + a `create()` branch, no call-site edits;
+  read `docs/project/optimizer_state_model.md` first. Non-param-shaped states (FP8 scales) are
+  unsupported (guarded by assert).
 - **I-12 — cross-repo patches are mirrored, not symlinked.** After editing
   `Megatron-LM-custom/megatron/training/training.py`, copy it into
   `examples/intra_process/training_016.py` and update `examples/intra_process/README.md`.
