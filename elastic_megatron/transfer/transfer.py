@@ -20,13 +20,14 @@ from ..resharding.resharding_metadata import OptimizerTensorInfo
 from ..resharding.resharding_pp import LayerType, ParamPositionAttr
 from ..resharding.util import ParamRange, Range, Timer
 from ..resharding.virtual_param import VirtualParam, VirtualParamSpace
-from .communicator import Communicator
+from .communicator import BatchedTransfer, Communicator
 
 
 class TransferManager:
     def __init__(self, send_fn: Callable, recv_fn: Callable, broadcast_fn: Callable):
         self._rank = torch.distributed.get_rank()
         self.communicator = Communicator(self._rank, send_fn, recv_fn, broadcast_fn)
+        self.batched_transfer = BatchedTransfer(self.communicator)
         self.send = self.communicator.send
         self.recv = self.communicator.recv
         self.broadcast = self.communicator.broadcast
@@ -78,7 +79,7 @@ class TransferManager:
         self._collect_send(
             send_transfer_range_dict, src_optimizer_tensor_info, send_tasks
         )
-        self.communicator.transfer(send_tasks, {}, pack=self._pack)
+        self.batched_transfer.transfer(send_tasks, {}, pack=self._pack)
         src_optimizer_tensor_info.release()
 
     def _recv_optimizer_tensors(
@@ -100,7 +101,7 @@ class TransferManager:
             recv_tasks,
             recv_copy_back,
         )
-        self.communicator.transfer({}, recv_tasks, pack=self._pack)
+        self.batched_transfer.transfer({}, recv_tasks, pack=self._pack)
         for recv_slice, recv_buffer in recv_copy_back:
             recv_slice.data.copy_(recv_buffer)
 
@@ -350,7 +351,7 @@ class TransferManager:
                     self._collect_recv(recv_range, dst_info, recv_tasks, recv_copy_back)
 
         with self._timed(timings, "Transfer"):
-            self.communicator.transfer(
+            self.batched_transfer.transfer(
                 send_tasks,
                 recv_tasks,
                 pack=self._pack,
