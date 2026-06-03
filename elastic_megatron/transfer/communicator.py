@@ -253,7 +253,8 @@ class Communicator:
             self._communication_bytes += tensor.nbytes
 
     def get_communication_bytes(self) -> CommunicationBytes:
-        """Get the communication bytes(GB) and reset the communication bytes to 0"""
+        """Return the per-peer and total communication byte counts (raw bytes,
+        not GB) and reset the counters to 0."""
         communication_bytes = self._communication_bytes
         communication_bytes_send = self._communication_bytes_send
         communication_bytes_recv = self._communication_bytes_recv
