@@ -1,8 +1,9 @@
 import torch
+
 from ..distributed.elastic_process_group import (
-    get_p2p_collective_group,
-    create_p2p_collective_groups,
     ElasticProcessGroup,
+    create_p2p_collective_groups,
+    get_p2p_collective_group,
 )
 
 

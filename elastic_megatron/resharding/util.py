@@ -1,7 +1,6 @@
-from typing import List, Tuple
-import torch
 import time
 
+import torch
 from packaging import version
 
 VERSION_MINOR = None
@@ -67,6 +66,9 @@ class Range:
         assert global_offset <= self.start
         return Range(self.start - global_offset, self.end - global_offset)
 
+    def __str__(self):
+        return "%d,%d [%d]" % (self.start, self.end, self.size)
+
     def __len__(self):
         return self.end - self.start
 
@@ -99,20 +101,14 @@ class Range:
         assert self.is_contain(sub_range)
         return tuple([slice(sub_range.start, sub_range.end)])
 
-    def __str__(self):
-        return f"Range([{self.start},{self.end}) [size={self.size}])"
-
-    def __repr__(self):
-        return str(self)
-
 
 class ParamRange:
     def __init__(
         self,
-        ranges: List[Range] = None,
+        ranges: list[Range] = None,
         param_shape: torch.Size = None,
     ):
-        self.shapes: List[Range] = []
+        self.shapes: list[Range] = []
         if param_shape is not None:
             for _size in param_shape:
                 self.shapes.append(Range(0, _size))
@@ -131,7 +127,7 @@ class ParamRange:
         for shape in self.shapes:
             self.size *= shape.size
 
-    def normalize(self, global_offsets: List[int] = None) -> "ParamRange":
+    def normalize(self, global_offsets: list[int] = None) -> "ParamRange":
         if global_offsets is None:
             global_offsets = [0] * self.dims
         else:
@@ -146,7 +142,7 @@ class ParamRange:
 
     def chunk(self, split: int, dim: int):
         assert 0 <= dim < self.dims
-        dim_range_views: List[Range] = self.shapes[dim].chunk(split=split)
+        dim_range_views: list[Range] = self.shapes[dim].chunk(split=split)
         views = []
         for view in dim_range_views:
             new_shapes = list(self.shapes)
@@ -174,7 +170,7 @@ class ParamRange:
                 sub_dim = dim
         return sub_dim
 
-    def get_sub_range_slices(self, sub_range: "ParamRange") -> Tuple[slice]:
+    def get_sub_range_slices(self, sub_range: "ParamRange") -> tuple[slice]:
         """Get sub_range slices."""
         assert self.is_normalized
         assert isinstance(sub_range, ParamRange)
@@ -205,10 +201,9 @@ class ParamRange:
         return self.size
 
     def __str__(self):
-        msg = "ParamRange("
+        msg = ""
         for i, shape in enumerate(self.shapes):
-            msg += f"dim{i} = {str(shape)}  "
-        msg += ")"
+            msg += f"dim{i} = {shape!s}  "
         return msg
 
     def __repr__(self):

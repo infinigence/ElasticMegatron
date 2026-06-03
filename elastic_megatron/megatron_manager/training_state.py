@@ -1,22 +1,25 @@
 import gc
-import torch
-from megatron.training.global_vars import get_args, get_timers
-from megatron.core.utils import get_model_config
-from megatron.core.distributed import finalize_model_grads
-from megatron.core.optimizer import MegatronOptimizer, ChainedOptimizer
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-from typing import List, Callable, Dict, Optional
-
-from megatron.training.checkpointing import save_checkpoint
-from megatron.training.training import preprocess_common_state_dict
 import os
 import pathlib
+from collections.abc import Callable
 
+import torch
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import finalize_model_grads
+from megatron.core.optimizer import (
+    ChainedOptimizer,
+    MegatronOptimizer,
+)
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.utils import get_model_config
+from megatron.training.checkpointing import save_checkpoint
+from megatron.training.global_vars import get_args, get_timers
+from megatron.training.training import preprocess_common_state_dict
 
+from ..resharding.optimizer_adapter import OptimizerAdapter
 from ..resharding.resharding_metadata import (
-    generate_resharding_metadata,
     OptimizerTensorInfo,
+    generate_resharding_metadata,
 )
 from .parallel_strategy import ParallelStrategy
 
@@ -76,6 +79,7 @@ class TrainingState:
     def setup_model_and_optimizer(cls, *args, **kwargs):
         is_meta_device = kwargs.pop("is_meta_device", False)
         from contextlib import nullcontext
+
         from .meta_device_context import meta_device_context
 
         build_model_context = nullcontext()
@@ -89,7 +93,7 @@ class TrainingState:
 
     def __init__(
         self,
-        model: List[DDP],
+        model: list[DDP],
         optimizer: MegatronOptimizer,
         opt_param_scheduler: OptimizerParamScheduler,
     ):
@@ -137,7 +141,7 @@ class TrainingState:
         return config
 
     @property
-    def optimizers(self) -> List[MegatronOptimizer]:
+    def optimizers(self) -> list[MegatronOptimizer]:
         if isinstance(self.optimizer, ChainedOptimizer):
             return self.optimizer.chained_optimizers
         return [self.optimizer]
@@ -179,16 +183,47 @@ class TrainingState:
         if self.model_offloaded:
             self.rebuild_model()
 
-        # Copy main params to model params
-        if isinstance(self.optimizer, ChainedOptimizer):
-            for optimizer in self.optimizer.chained_optimizers:
-                optimizer._copy_main_params_to_model_params()
-        else:
-            self.optimizer._copy_main_params_to_model_params()
+        # Copy main params to model params. The adapter does the plain
+        # _copy_main_params_to_model_params, and — under --use-precision-aware-optimizer
+        # (required by HybridDeviceOptimizer), where that call is a no-op (the
+        # master->model copy normally happens inside optimizer.step(), which a reshard
+        # never runs) — also the explicit refill of model param_data from the transferred
+        # fp32 master. See docs/hybrid_adam/megatron_hybrid_optimizer.md §6.
+        optimizers = (
+            self.optimizer.chained_optimizers
+            if isinstance(self.optimizer, ChainedOptimizer)
+            else [self.optimizer]
+        )
+        for optimizer in optimizers:
+            OptimizerAdapter.create(optimizer).copy_main_to_model()
 
         args = get_args()
         if not args.use_distributed_optimizer:
             return
+
+        # Clear any stale async param-gather handle before the forced sync. A
+        # re-entered cached model chunk (e.g. reshard back to a previously-used
+        # strategy) can still hold a pending param_gather_handle from before its
+        # release; start_param_sync(force_sync=True) would `.wait()` on it and
+        # deadlock, because the matching all-gather is never re-issued after the
+        # reshard rebuilt the buffers/groups. Resetting to None makes every rank
+        # fall through and issue a FRESH, matched all-gather. (No-op when the handle
+        # is already None, i.e. the non-precision-aware path.) See
+        # docs/hybrid_adam/changelog.md (TP2->TP1 start_param_sync hang).
+        for model_chunk in self.optimizer.model_chunks:
+            for bucket_group in (
+                getattr(model_chunk, "bucket_groups", [])
+                + getattr(model_chunk, "expert_parallel_bucket_groups", [])
+            ):
+                bucket_group.param_gather_handle = None
+                # The shard views in cached_param_buffer_shard_list reference the OLD
+                # param_data storage captured during this chunk's previous active period;
+                # release_model/rebuild_model changed the storage, so they are stale on a
+                # re-entered chunk. Force a rebuild against the current param_data.
+                if getattr(bucket_group, "cached_param_buffer_shard_list", None):
+                    bucket_group.cached_param_buffer_shard_list = [
+                        None
+                    ] * len(bucket_group.cached_param_buffer_shard_list)
 
         # Sync model params in DP-Group
         self.optimizer.update_successful = True
@@ -293,9 +328,19 @@ class TrainingState:
                         buffer.grad_data.zero_()
 
                     if buffer.param_data.untyped_storage().size() == 0:
-                        buffer.param_data.untyped_storage().resize_(
-                            buffer.param_data_size
+                        # Normally release_model recorded param_data_size. Under
+                        # --use-precision-aware-optimizer the freshly-built dst model's
+                        # param_data is already storage-0 at release time (the weights
+                        # are held in the optimizer's master buffer), so the size was
+                        # never recorded — fall back to the buffer's own element count
+                        # (bytes). _copy_main_params_to_model_params (update_model_weight
+                        # step 5.2) then refills it from the transferred master.
+                        param_data_size = getattr(
+                            buffer,
+                            "param_data_size",
+                            buffer.param_data.numel() * buffer.param_data.element_size(),
                         )
+                        buffer.param_data.untyped_storage().resize_(param_data_size)
                         if onload_weight:
                             buffer.param_data.copy_(
                                 buffer.param_data.cpu_data, non_blocking=True
@@ -324,11 +369,11 @@ class TrainingState:
 
     def save_checkpoint(
         self,
-        iteration: Optional[int] = None,
-        num_floating_point_operations_so_far: Optional[float] = None,
+        iteration: int | None = None,
+        num_floating_point_operations_so_far: float | None = None,
         preprocess_common_state_dict_fn=preprocess_common_state_dict,
         is_before_reshard: bool = True,
-        save_path: Optional[str] = None,
+        save_path: str | None = None,
     ):
         args = get_args()
         if iteration is None:
@@ -337,13 +382,18 @@ class TrainingState:
             num_floating_point_operations_so_far = getattr(
                 args, "num_floating_point_operations_so_far", 0.0
             )
-        prev_use_dist_ckpt = getattr(args, "use_dist_ckpt", True)
-        args.use_dist_ckpt = False
+        prev_save = getattr(args, "save", None)
+        # 0.16 下 swiglu 用 closure-based sharded factory,legacy(torch pickle)ckpt
+        # 序列化失败。保持 args.use_dist_ckpt 默认 True,让 save_checkpoint 走 torch_dist。
+        # 这里不再改/复原 args.use_dist_ckpt;调用方若要 legacy,自己负责 save/restore。
 
         if save_path is None:
-            cwd = pathlib.Path(os.environ["SAVE_PATH"])
+            # 基于本文件位置定位 ElasticMegatron repo 根,与 cwd 解耦,
+            # 避免用户在不同子目录 import 调用导致路径错位。
+            repo_root = pathlib.Path(__file__).resolve().parents[2]
             save_dir = (
-                cwd
+                repo_root
+                / "tools"
                 / "ckpt"
                 / ("before_reshard" if is_before_reshard else "after_reshard")
             )
@@ -352,19 +402,22 @@ class TrainingState:
         os.makedirs(save_dir, exist_ok=True)
 
         args.save = str(save_dir)
-        optimizer = self.optimizers[0]
-        save_checkpoint(
-            iteration,
-            self.model,
-            optimizer,
-            self.opt_param_scheduler,
-            num_floating_point_operations_so_far,
-            preprocess_common_state_dict_fn=preprocess_common_state_dict_fn,
-        )
-        args.use_dist_ckpt = prev_use_dist_ckpt
+        try:
+            save_checkpoint(
+                iteration,
+                self.model,
+                self.optimizer,
+                self.opt_param_scheduler,
+                num_floating_point_operations_so_far,
+                preprocess_common_state_dict_fn=preprocess_common_state_dict_fn,
+            )
+        finally:
+            # 恢复:否则 pretrain() 收尾段会用 args.save / args.save_interval
+            # 触发不必要的 save 路径(save_interval 可能是 None,直接报 TypeError)。
+            args.save = prev_save
 
 
-def load_state_dict_with_no_step(lr: OptimizerParamScheduler, state_dict: Dict):
+def load_state_dict_with_no_step(lr: OptimizerParamScheduler, state_dict: dict):
     origin_step = OptimizerParamScheduler.step
 
     def foo(*args, **kwargs):
@@ -377,15 +430,17 @@ def load_state_dict_with_no_step(lr: OptimizerParamScheduler, state_dict: Dict):
 
 
 def update_state_dict(
-    src_state_dict: Dict, dst_state_dict: Dict, exclude_keys: List[str] = ["params"]
+    src_state_dict: dict, dst_state_dict: dict, exclude_keys: list[str] | None = None
 ):
+    if exclude_keys is None:
+        exclude_keys = ["params"]
     for key, value in src_state_dict.items():
         if key not in exclude_keys:
             dst_state_dict[key] = value
 
 
 def update_optimizer_by_state_dict(
-    optimizer: MegatronOptimizer, state_param_groups: List[Dict]
+    optimizer: MegatronOptimizer, state_param_groups: list[dict]
 ):
     assert isinstance(optimizer, MegatronOptimizer) and not isinstance(
         optimizer, ChainedOptimizer
@@ -398,11 +453,13 @@ def update_optimizer_by_state_dict(
 
 
 def update_optimizer_and_opt_param_scheduler(
-    src_optimizers: List[MegatronOptimizer],
+    src_optimizers: list[MegatronOptimizer],
     src_opt_param_scheduler: OptimizerParamScheduler,
-    dst_optimizers: List[MegatronOptimizer],
+    dst_optimizers: list[MegatronOptimizer],
     dst_opt_param_scheduler: OptimizerParamScheduler,
 ):
+    # zip copy is positional (lr/betas etc.); step must be broadcast explicitly to
+    # ALL dst chaineds, including newly-created ones beyond the zip range.
     for src_optimizer, dst_optimizer in zip(src_optimizers, dst_optimizers):
         src_state_dict = src_optimizer.state_dict()
         dst_state_dict = dst_optimizer.state_dict()
@@ -418,6 +475,26 @@ def update_optimizer_and_opt_param_scheduler(
         update_optimizer_by_state_dict(
             dst_optimizer, dst_state_dict["optimizer"]["param_groups"]
         )
+
+    # Broadcast step to all dst chaineds (mcore _synchronize_steps requires all
+    # chaineds to carry the same step value).
+    src_step = None
+    for src_optimizer in src_optimizers:
+        sd = src_optimizer.state_dict()
+        for pg in sd["optimizer"]["param_groups"]:
+            if "step" in pg:
+                src_step = pg["step"]
+                break
+        if src_step is not None:
+            break
+
+    if src_step is not None:
+        for dst_optimizer in dst_optimizers:
+            for pg in dst_optimizer.optimizer.param_groups:
+                # 只设有非空 params 的 group(空 group 在 TE FusedAdam 下没有 step,
+                # mcore _synchronize_steps 也跳过它们,保持一致)
+                if len(pg.get("params", [])) > 0:
+                    pg["step"] = src_step
 
     # Update opt_param_scheduler
     load_state_dict_with_no_step(

@@ -1,47 +1,77 @@
 import re
-from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
+
 import torch
 from megatron.core.distributed import DistributedDataParallel
 from megatron.core.optimizer import (
-    MegatronOptimizer,
     ChainedOptimizer,
-    DistributedOptimizer,
+    MegatronOptimizer,
 )
 from megatron.training import get_args
-from .util import Range, ParamRange
 
 from ..megatron_manager.parallel_strategy import ParallelStrategy
-from .resharding_pp import ParamPositionAttr, LayerType
+from .optimizer_adapter import OptimizerAdapter, OptState
+from .resharding_pp import LayerType, ParamPositionAttr
 from .resharding_tp import TensorParallelAttr
+from .util import ParamRange
+
+# OptState is defined in optimizer_adapter (alongside the adapter that produces it)
+# and re-exported here, where OptimizerTensorInfo consumes it, to keep existing
+# imports (`from ...resharding_metadata import OptState`) working.
+__all__ = ["OptState", "OptimizerTensorInfo", "ParamReshardingMetaData"]
 
 
 @dataclass
 class OptimizerTensorInfo:
-    main_weight: torch.Tensor
-    exp_avg: torch.Tensor
-    exp_avg_sq: torch.Tensor
+    # Ordered, variable-length set of named states. ``states[0]`` is the master
+    # weight and serves as the geometry anchor. Adam => [main_weight, exp_avg,
+    # exp_avg_sq]; other optimizers may carry a different count/dtype per state.
+    states: list[OptState]
     optimizer_tensor_range_in_model_param: (
         ParamRange  # sub-range of the param that this data-parallel rank owns.
     )
     model_param_range: ParamRange
 
     def __post_init__(self):
-        self.optimizer_tensor_shape = self.main_weight.shape
-        self.optimizer_tensors = [self.main_weight, self.exp_avg, self.exp_avg_sq]
+        assert len(self.states) >= 1, "need at least the master-weight state"
+        # Working list; create_padded swaps this to padded buffers and back.
+        self.optimizer_tensors = [s.tensor for s in self.states]
+        self.state_names = [s.name for s in self.states]
+        self.optimizer_tensor_shape = self.states[0].tensor.shape
 
+        anchor_numel = self.optimizer_tensor_shape.numel()
+        for s in self.states:
+            assert s.tensor.numel() == anchor_numel, (
+                f"optimizer state '{s.name}' is not param-shaped "
+                f"({s.tensor.numel()} != {anchor_numel} elems). Non-param-shaped "
+                "states (e.g. FP8 per-block scales) are unsupported; see I-15."
+            )
         assert (
             self.optimizer_tensor_range_in_model_param.size
             <= self.model_param_range.size
         )
-        assert (
-            self.optimizer_tensor_shape.numel()
-            == self.optimizer_tensor_range_in_model_param.size
-        )
+        assert anchor_numel == self.optimizer_tensor_range_in_model_param.size
 
-    def update_optimizer_tensors(self, new_optimizer_tensors: List[torch.Tensor]):
+    # --- read-only accessors; main_weight/exp_avg/exp_avg_sq are the real (never
+    # padded) state tensors, kept for Adam-shaped call sites (e.g. ipc_manager). ---
+    @property
+    def main_weight(self) -> torch.Tensor:
+        return self.states[0].tensor
+
+    def state_tensor(self, name: str) -> torch.Tensor:
+        return self.states[self.state_names.index(name)].tensor
+
+    @property
+    def exp_avg(self) -> torch.Tensor:
+        return self.state_tensor("exp_avg")
+
+    @property
+    def exp_avg_sq(self) -> torch.Tensor:
+        return self.state_tensor("exp_avg_sq")
+
+    def update_optimizer_tensors(self, new_optimizer_tensors: list[torch.Tensor]):
         """Update meta-device optimizer tensors by new optimizer tensors."""
-        assert self.main_weight.device == torch.device("meta"), (
+        assert self.states[0].tensor.device == torch.device("meta"), (
             "Only support update optimizer tensors on meta device"
         )
         assert len(new_optimizer_tensors) == len(self.optimizer_tensors)
@@ -50,9 +80,8 @@ class OptimizerTensorInfo:
         ):
             assert old_tensor.shape == new_tensor.shape
             assert old_tensor.dtype == new_tensor.dtype
-        self.main_weight = new_optimizer_tensors[0]
-        self.exp_avg = new_optimizer_tensors[1]
-        self.exp_avg_sq = new_optimizer_tensors[2]
+        for s, new_tensor in zip(self.states, new_optimizer_tensors):
+            s.tensor = new_tensor
         self.optimizer_tensors = new_optimizer_tensors
 
     def rebuild(self):
@@ -76,13 +105,16 @@ class OptimizerTensorInfo:
 
         model_param_shape: torch.Size = self.model_param_range.to_torch_size()
 
+        # One padded buffer per state, each with that state's OWN dtype/device
+        # (Adam: all match the master; this generalizes to per-state dtype and to
+        # CPU-resident states without special-casing).
         self.padded_optimizer_tensors = [
             torch.empty(
                 model_param_shape,
-                dtype=self.main_weight.dtype,
-                device=self.main_weight.device,
+                dtype=t.dtype,
+                device=t.device,
             ).view(-1)
-            for _ in range(3)
+            for t in self.optimizer_tensors
         ]
         self.origin_optimizer_tensors = self.optimizer_tensors
         self.optimizer_tensors = self.padded_optimizer_tensors
@@ -185,100 +217,29 @@ class ParamReshardingMetaData:
     optimizer_tensor_info: OptimizerTensorInfo
 
 
-MODEL_PARAM_TO_OPT_PARAM_INDEX = None
-
-
-def set_model_to_optimizer_index_dict(
-    model_to_optimizer_index_dict: Dict[torch.nn.Parameter, Tuple[int, int]],
-):
-    global MODEL_PARAM_TO_OPT_PARAM_INDEX
-    MODEL_PARAM_TO_OPT_PARAM_INDEX = model_to_optimizer_index_dict
-
-
-def get_model_to_optimizer_index_dict():
-    global MODEL_PARAM_TO_OPT_PARAM_INDEX
-    return MODEL_PARAM_TO_OPT_PARAM_INDEX
-
-
-def init_model_to_optimizer_index_dict():
-    """Empty MODEL_PARAM_TO_OPT_PARAM_INDEX at the beginning of the generate_model_and_optimizer_metadata()."""
-    set_model_to_optimizer_index_dict({})
-
-
-def get_main_weight(
-    optimizer: MegatronOptimizer,
-    model_weight: torch.nn.Parameter,
-) -> Optional[torch.Tensor]:
-    if isinstance(optimizer, DistributedOptimizer):
-        if model_weight in optimizer.model_param_group_index_map:
-            group_index, group_order = optimizer.model_param_group_index_map[
-                model_weight
-            ]
-            main_weight = optimizer.optimizer.param_groups[group_index]["params"][
-                group_order
-            ]
-            return main_weight
-        return None
-
-    model_to_optimizer_index_dict: Dict[torch.nn.Parameter, Tuple[int, int]] = (
-        get_model_to_optimizer_index_dict()
-    )
-    if not model_to_optimizer_index_dict:
-        for i, group in enumerate(optimizer.float16_groups):
-            for j, param in enumerate(group):
-                model_to_optimizer_index_dict[param] = (i, j)
-        set_model_to_optimizer_index_dict(model_to_optimizer_index_dict)
-
-    i, j = model_to_optimizer_index_dict.get(model_weight, (-1, -1))
-    return optimizer.fp32_from_float16_groups[i][j]
-
-
-def init_empty_state_dict(
-    optimizer: MegatronOptimizer, main_weight: torch.nn.Parameter
-):
-    optimizer.state[main_weight]["exp_avg"] = torch.zeros_like(main_weight.data)
-    optimizer.state[main_weight]["exp_avg_sq"] = torch.zeros_like(main_weight.data)
-    optimizer.state[main_weight]["exp_avg"].storage().resize_(0)
-    optimizer.state[main_weight]["exp_avg_sq"].storage().resize_(0)
-
-
 def get_optimizer_tensors_by_model_weight(
     optimizer: MegatronOptimizer,
     model_weight: torch.nn.Parameter,
     offload_opt_tensors: bool,
 ) -> OptimizerTensorInfo | None:
-    """Get OptimizerTensorInfo by model weight."""
+    """Get OptimizerTensorInfo by model weight.
 
-    main_weight = get_main_weight(optimizer, model_weight)
+    Optimizer-implementation specifics (how to find the master, initialize empty
+    state, discover the named states, compute the dp sub-range) are delegated to an
+    OptimizerAdapter — this function is the optimizer-agnostic assembly of those parts.
+    """
+    adapter = OptimizerAdapter.create(optimizer)
+
+    main_weight = adapter.get_main_weight(model_weight)
     if main_weight is None:
         return None
 
-    opt_tensor_shape = torch.Size(main_weight.shape)
-    state_initialized = len(optimizer.optimizer.state[main_weight]) != 0
-
-    # Init optimizer.state. If offload_opt_tensors is True, offload the optimizer tensors.
-    if not state_initialized:
-        if not offload_opt_tensors:
-            optimizer.init_state_fn(optimizer.optimizer)
-        else:
-            init_empty_state_dict(optimizer.optimizer, main_weight)
-            main_weight.storage().resize_(0)
-
-    # Get the sub-range of the optimizer tensor in the model parameter.
-    if isinstance(optimizer, DistributedOptimizer):
-        sub_range = optimizer._get_model_param_range_map(model_weight)["param"]
-        # Convert this megatron.core.optimizer.distrib_optimizer.Range to ParamRange.
-        sub_range_in_model_param = ParamRange(
-            ranges=[Range(sub_range.start, sub_range.end)]
-        )
-        assert sub_range_in_model_param.size == opt_tensor_shape.numel()
-    else:
-        sub_range_in_model_param = ParamRange(param_shape=model_weight.shape)
+    adapter.ensure_state_initialized(model_weight, main_weight, offload_opt_tensors)
+    sub_range_in_model_param = adapter.model_param_sub_range(model_weight, main_weight)
+    states = adapter.discover_states(model_weight, main_weight)
 
     return OptimizerTensorInfo(
-        main_weight=main_weight,
-        exp_avg=optimizer.optimizer.state[main_weight]["exp_avg"],
-        exp_avg_sq=optimizer.optimizer.state[main_weight]["exp_avg_sq"],
+        states=states,
         optimizer_tensor_range_in_model_param=sub_range_in_model_param,
         model_param_range=ParamRange(param_shape=model_weight.shape),
     )
@@ -307,10 +268,19 @@ def get_optimizer_tensors(
 def get_tensor_parallel_attr(
     param: torch.nn.Parameter,
     tensor_model_parallel_size: int,
+    is_expert: bool = False,
 ) -> TensorParallelAttr:
-    tensor_model_parallel: bool = getattr(param, "tensor_model_parallel")
+    tensor_model_parallel: bool = param.tensor_model_parallel
     if not tensor_model_parallel:
         return TensorParallelAttr(model_param=param)
+    # MoE experts with TPE==1 are not actually TP-split, yet 0.16's TE
+    # GroupedLinear sets `partition_dim` to an implementation-defined default
+    # that differs between EP configs (EP>1 disables TE's parallel_mode, EP==1
+    # keeps it). Force the attr to "unsharded" for this specific case so src
+    # and dst metadata match during reshard. Dense params keep their real
+    # partition_dim/stride even at TP=1, since TP>1 peers need that info.
+    if is_expert and tensor_model_parallel_size == 1:
+        return TensorParallelAttr(model_param=param, force_unsharded=True)
 
     return TensorParallelAttr(
         model_param=param,
@@ -386,13 +356,25 @@ def get_param_position_attr(
     )
 
 
+def _is_expert_param(name: str, param: torch.nn.Parameter) -> bool:
+    """Decide whether a parameter belongs to a MoE expert.
+
+    The historical check ``not getattr(param, "allreduce", True)`` is unreliable
+    on Megatron 0.16: TE's GroupedLinear sets ``allreduce`` based on whether
+    ``expert_parallel`` is enabled (EP>1), so the same expert param flips from
+    ``False`` at EP=2 to ``True`` at EP=1. The module-path check below stays
+    consistent across EP sizes, which matters when we compare src and dst
+    reshard metadata for the same logical parameter.
+    """
+    return ".experts." in name
+
+
 def generate_optimizer_tensor_info(
-    model: List[DistributedDataParallel],
+    model: list[DistributedDataParallel],
     optimizer: MegatronOptimizer,
     offload_opt_tensors: bool = False,
 ) -> dict[torch.nn.Parameter, OptimizerTensorInfo]:
     """Generate optimizer tensor info for each parameter."""
-    init_model_to_optimizer_index_dict()
     params_to_optimizer_tensor_info: dict[torch.nn.Parameter, OptimizerTensorInfo] = (
         dict()
     )
@@ -402,7 +384,7 @@ def generate_optimizer_tensor_info(
                 assert param.data.nelement() == 0
                 continue
 
-            is_expert = not getattr(param, "allreduce", True)
+            is_expert = _is_expert_param(name, param)
 
             optimizer_tensor_info: OptimizerTensorInfo = get_optimizer_tensors(
                 optimizer, param, offload_opt_tensors, is_expert
@@ -413,11 +395,11 @@ def generate_optimizer_tensor_info(
 
 
 def generate_resharding_metadata(
-    model: List[DistributedDataParallel],
+    model: list[DistributedDataParallel],
     optimizer: MegatronOptimizer,
     parallel_strategy: ParallelStrategy,
     offload_opt_tensors: bool = False,
-) -> Dict[torch.nn.Parameter, ParamReshardingMetaData]:
+) -> dict[torch.nn.Parameter, ParamReshardingMetaData]:
     """Generate resharding metadata.
 
     Args:
@@ -445,7 +427,7 @@ def generate_resharding_metadata(
                 assert param.data.nelement() == 0
                 continue
 
-            is_expert = not getattr(param, "allreduce", True)
+            is_expert = _is_expert_param(name, param)
 
             # Get the position attributes of the parameter.
             param_position_attr: ParamPositionAttr = get_param_position_attr(
@@ -467,6 +449,7 @@ def generate_resharding_metadata(
             tensor_parallel_attr: TensorParallelAttr = get_tensor_parallel_attr(
                 param,
                 parallel_strategy.get_tensor_model_parallel_size(is_expert),
+                is_expert=is_expert,
             )
 
             # Get the optimizer tensor info of the parameter.
@@ -486,7 +469,7 @@ def generate_resharding_metadata(
 
 
 def update_layer_index(
-    params_to_resharding_metadata: Dict[torch.nn.Parameter, ParamReshardingMetaData],
+    params_to_resharding_metadata: dict[torch.nn.Parameter, ParamReshardingMetaData],
 ):
     # Key = tuple(LayerType, transformer_layer_id)
     dense_layer_index_dict: dict[tuple[LayerType, int], int] = {}

@@ -4,7 +4,8 @@ set -e
 # Paths
 BASE_PATH=${BASE_PATH:-/workspace}
 ELASTIC_MEGATRON_PATH="${BASE_PATH}/ElasticMegatron"
-export PYTHONPATH=${ELASTIC_MEGATRON_PATH}:${BASE_PATH}/Megatron-LM
+MEGATRON_PATH=${MEGATRON_PATH:-${BASE_PATH}/Megatron-LM}
+export PYTHONPATH=${ELASTIC_MEGATRON_PATH}:${MEGATRON_PATH}
 
 # Source parallel strategy settings
 TP=${TP:-2}
@@ -42,7 +43,7 @@ python ${ELASTIC_MEGATRON_PATH}/tools/ckpt/run_convert_patch_loader.py \
   --target-expert-parallel-size ${TARGET_EP} \
   --loader-transformer-impl transformer_engine \
   --saver-transformer-impl transformer_engine \
-  --megatron-path ${ELASTIC_MEGATRON_PATH}/Megatron-LM \
+  --megatron-path ${MEGATRON_PATH} \
   --true-vocab-size 32000
 
 echo "----------------------------------------------------------------"

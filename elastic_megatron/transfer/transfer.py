@@ -1,25 +1,25 @@
-from collections import defaultdict
 import os
-from typing import Dict, List, Tuple, Callable
+from collections import defaultdict
+from collections.abc import Callable
+from typing import Dict, List, Tuple
+
 import torch
-from .communicator import Communicator
-
-
-from ..resharding.virtual_param import VirtualParamSpace, VirtualParam
 from megatron.core import parallel_state
-from ..resharding.resharding_metadata import OptimizerTensorInfo
-from ..resharding.resharding_pp import ParamPositionAttr, LayerType
-from ..resharding.util import ParamRange, Timer
-from ..resharding.util import Range
+from megatron.core.optimizer import MegatronOptimizer
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+
 from ..megatron_manager.parallel_strategy import ParallelStrategy
 from ..megatron_manager.training_state import (
     TrainingState,
-    update_optimizer_by_state_dict,
     load_state_dict_with_no_step,
+    update_optimizer_by_state_dict,
 )
-from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.core.optimizer import MegatronOptimizer
 from ..resharding.resharding import ReshardPlan
+from ..resharding.resharding_metadata import OptimizerTensorInfo
+from ..resharding.resharding_pp import LayerType, ParamPositionAttr
+from ..resharding.util import ParamRange, Range
+from ..resharding.virtual_param import VirtualParam, VirtualParamSpace
+from .communicator import Communicator
 
 from megatron.core.timers import Timers as MegatronTimers
 
@@ -44,7 +44,7 @@ class TransferManager:
 
     def _send_optimizer_tensors(
         self,
-        send_transfer_range_dict: Dict[int, ParamRange] | Dict[int, Range],
+        send_transfer_range_dict: dict[int, ParamRange] | dict[int, Range],
         src_optimizer_tensor_info: OptimizerTensorInfo,
     ):
         if send_transfer_range_dict is None or src_optimizer_tensor_info is None:
@@ -82,7 +82,7 @@ class TransferManager:
 
     def _recv_optimizer_tensors(
         self,
-        recv_transfer_range_dict: Dict[int, ParamRange],
+        recv_transfer_range_dict: dict[int, ParamRange],
         dst_optimizer_tensor_info: OptimizerTensorInfo,
     ):
         if recv_transfer_range_dict is None or dst_optimizer_tensor_info is None:
@@ -167,7 +167,7 @@ class TransferManager:
 
         # Step-1 : Get DP-distribution and aligned global rank
         reshard_plan: ReshardPlan = virtual_param.reshard_plan
-        dp_distribution: Dict[int, Range] = (
+        dp_distribution: dict[int, Range] = (
             reshard_plan.data_parallel_resharding_info.src_dp_distribution_with_global_rank
         )
         aligned_global_rank = (
@@ -217,6 +217,18 @@ class TransferManager:
             This process will only be executed on the aligned_dp_rank.
         """
         reshard_plan: ReshardPlan = virtual_param.reshard_plan
+
+        # Best-effort guard: when this rank holds both sides (self/survival
+        # transfer), the src and dst must carry the same ordered state set —
+        # _send/_recv zip optimizer_tensors positionally. No-op when only one
+        # side is present on this rank. Always holds for Adam (both = 3 states).
+        src_info = virtual_param.src_optimizer_tensor_info
+        dst_info = virtual_param.dst_optimizer_tensor_info
+        if src_info is not None and dst_info is not None:
+            assert src_info.state_names == dst_info.state_names, (
+                f"src/dst optimizer state set mismatch: {src_info.state_names} vs "
+                f"{dst_info.state_names}; heterogeneous state sets are unsupported."
+            )
 
         # Step-1 : Send tensors
         self._send_optimizer_tensors(
@@ -511,7 +523,7 @@ class TransferManager:
             virtual_param.dst_optimizer_tensor_info
         )
         if dst_optimizer_tensor_info is None:
-            return None
+            return
 
         # Step-1 : Find the aligned_dp_rank
         reshard_plan = virtual_param.reshard_plan
@@ -530,7 +542,7 @@ class TransferManager:
 
         # Step-3 : Scatter params to all dp ranks and release the padded optimizer tensor
 
-        dp_distribution: Dict[int, Range] = (
+        dp_distribution: dict[int, Range] = (
             reshard_plan.data_parallel_resharding_info.dst_dp_distribution_with_global_rank
         )
         if (
@@ -622,13 +634,13 @@ class TransferManager:
 
     def redundant_backup(
         self,
-        is_sacle_up: bool,
+        is_scale_up: bool,
         src_training_state: TrainingState,
         dst_training_state: TrainingState,
         group_src: int = 0,
     ):
         # Delete redundant backup
-        if not is_sacle_up:
+        if not is_scale_up:
             assert src_training_state is not None
             if dst_training_state is not None:
                 TrainingState.param_migrate(src_training_state, dst_training_state)
@@ -672,7 +684,7 @@ class TransferManager:
     # ------------------------------------------------------------------------------------------------
     def transfer_opt_param_scheduler(
         self,
-        optimizers: List[MegatronOptimizer],
+        optimizers: list[MegatronOptimizer],
         opt_param_scheduler: OptimizerParamScheduler,
     ):
         for optimizer in optimizers:
@@ -683,31 +695,31 @@ class TransferManager:
         self,
         optimizer: MegatronOptimizer,
     ):
-        broacast_object = None
+        broadcast_object = None
         if self._rank == 0:
-            broacast_object = []
+            broadcast_object = []
             state_dict = optimizer.state_dict()
             for param_group in state_dict["optimizer"]["param_groups"]:
-                broacast_object.append(
+                broadcast_object.append(
                     {
                         key: value
                         for key, value in param_group.items()
                         if key != "params"
                     }
                 )
-        broacast_object_list = [broacast_object]
-        torch.distributed.broadcast_object_list(broacast_object_list, src=0)
+        broadcast_object_list = [broadcast_object]
+        torch.distributed.broadcast_object_list(broadcast_object_list, src=0)
         if self._rank != 0:
-            update_optimizer_by_state_dict(optimizer, broacast_object_list[0])
+            update_optimizer_by_state_dict(optimizer, broadcast_object_list[0])
 
     def _transfer_param_scheduler(
         self,
         opt_param_scheduler: OptimizerParamScheduler,
     ):
-        broacast_object = None
+        broadcast_object = None
         if self._rank == 0:
-            broacast_object = opt_param_scheduler.state_dict()
-        broacast_object_list = [broacast_object]
-        torch.distributed.broadcast_object_list(broacast_object_list, src=0)
+            broadcast_object = opt_param_scheduler.state_dict()
+        broadcast_object_list = [broadcast_object]
+        torch.distributed.broadcast_object_list(broadcast_object_list, src=0)
         if self._rank != 0:
-            load_state_dict_with_no_step(opt_param_scheduler, broacast_object_list[0])
+            load_state_dict_with_no_step(opt_param_scheduler, broadcast_object_list[0])

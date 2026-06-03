@@ -124,4 +124,8 @@ def train(...):
 ```
 
 
-* If using Megatron 0.11 for training, you can directly replace `megatron/training/training.py` with `examples/intra_process/training_011.py`
+* If using Megatron 0.11 for training, you can directly replace `megatron/training/training.py` with `examples/intra_process/training_011.py`.
+* If using Megatron 0.16 for training, you can directly replace `megatron/training/training.py` with `examples/intra_process/training_016.py`. It is a snapshot of a working `training.py` after applying the ElasticMegatron patches required for 0.16, including:
+  - `ELASTIC_ENABLED` / `ELASTIC_STRATEGY_MODE` / `ELASTIC_RESHARD_INTERVAL` env-var driven `init_parallel_strategy_list` / `check_reshard` / `init_elastic_megatron_manager`.
+  - `ELASTIC_SAVE_CKPT=1` hook inside `train()` that saves before/after-reshard ckpts for offline verification (see `tools/ckpt/verify_all.sh`).
+  - Plain rebind `model = training_state.model` inside the elastic loop. **Important:** under this convention the launcher script must run with `--eval-iters 0` and no `--save` — `pretrain()`'s post-train eval/save path would otherwise read the original (now-released) model and crash with `setStorage size 0`. A previous version of this snapshot used `model[:] = training_state.model` to keep `pretrain()`'s reference live; that was reverted because the model list is aliased by every cached `TrainingState` (`ElasticMegatronManager.__init__` does not copy it), and in-place mutation poisons all cache slots — causing a `setStorage size 0` inside `update_model_weight()` on the second reshard back to a cached strategy. If you need real end-of-train eval, restore the slice-assignment **and** simultaneously break the aliasing in `TrainingState.__init__` (e.g. `self.model = list(model)`). See `docs/project/invariants.md` I-6.

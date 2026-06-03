@@ -1,11 +1,9 @@
+import inspect
+from dataclasses import asdict, dataclass
 from functools import wraps
-from typing import List, Dict, Tuple
 
 import torch
 from torch.distributed import ProcessGroup
-import inspect
-from dataclasses import dataclass, asdict
-
 
 _ORIGIN_NEW_GROUP_FN = None
 
@@ -86,9 +84,9 @@ class _ElasticProcessGroupManager:
         self._init_fn_patch()
 
         # Key : (ranks_set, backend)
-        self._pg_cache: Dict[Tuple[frozenset, str], ElasticProcessGroup] = {}
-        self._lazy_create_pg_cache: Dict[
-            Tuple[frozenset, str], ElasticProcessGroup
+        self._pg_cache: dict[tuple[frozenset, str], ElasticProcessGroup] = {}
+        self._lazy_create_pg_cache: dict[
+            tuple[frozenset, str], ElasticProcessGroup
         ] = {}
 
         self.world_group_initialized = False
@@ -156,7 +154,7 @@ class _ElasticProcessGroupManager:
         return len(self.WORLD_RANKS)
 
     def process_lazy_create_tasks(
-        self, lazy_create_params: List[ElasticProcessGroupParams]
+        self, lazy_create_params: list[ElasticProcessGroupParams]
     ):
         if len(lazy_create_params) == 0:
             return

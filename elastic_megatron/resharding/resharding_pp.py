@@ -1,7 +1,7 @@
-from typing import Tuple, Dict
-from megatron.training.global_vars import get_args
-from enum import Enum
 from dataclasses import dataclass
+from enum import Enum
+
+from megatron.training.global_vars import get_args
 
 
 @dataclass
@@ -47,18 +47,18 @@ class ParamPositionAttr:
         self.expert_id = expert_id
         self.expert_param_layer_id = expert_param_layer_id
 
-        self._check_initlalized = False
+        self._check_initialized = False
 
         # Cache
-        self._resharding_info_cache: Dict[
-            Tuple[int, int], PipelineParallelReshardingInfo
+        self._resharding_info_cache: dict[
+            tuple[int, int], PipelineParallelReshardingInfo
         ] = {}
 
     def _check_init(self):
         """Check the initialization of the parameter."""
-        if self._check_initlalized:
+        if self._check_initialized:
             return
-        self._check_initlalized = True
+        self._check_initialized = True
 
         assert self.global_index != -1
 
@@ -72,7 +72,7 @@ class ParamPositionAttr:
         else:
             assert self.transformer_layer_id == -1
 
-        self._pp_size_to_stage_id: Dict[int, int] = {}
+        self._pp_size_to_stage_id: dict[int, int] = {}
 
     def get_model_param_stage_id(self, pipeline_model_parallel_size: int) -> int:
         """Given a PP Size, get the stage id of the model param."""
