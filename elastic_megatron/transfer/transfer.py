@@ -35,7 +35,17 @@ class TransferManager:
         # synchronized) and the per-phase durations are printed on rank 0.
         # Disabled => the timing context managers are no-ops (zero overhead).
         self._log_transfer_timing = os.getenv("ELASTIC_TRANSFER_LOG_LEVEL", "1") != "0"
-        self.use_asyncbuffer_p2p = os.getenv("ELASTIC_USE_ASYNCBUFFER_P2P", "0") == "1"
+        # Pack each peer's slices into one buffer before NCCL (fast path) vs one
+        # p2p op per slice. The packed buffer lives on GPU, so packing doubles as
+        # CPU<->GPU staging for offloaded (HybridDeviceOptimizer) state.
+        self._pack = os.getenv("ELASTIC_USE_ASYNCBUFFER_P2P", "0") == "1"
+        # Optional cap on bytes in flight per batch_isend_irecv flush; bounds the
+        # GPU staging footprint. Unset => one batch for the whole transfer. Must
+        # be identical on every rank: it drives a step-aligned flush stride, and
+        # mismatched values would desync paired ranks.
+        self._max_inflight_bytes = (
+            int(os.getenv("ELASTIC_MAX_INFLIGHT_BYTES", "0")) or None
+        )
 
     @contextmanager
     def _timed(self, timings: dict[str, float] | None, name: str):
@@ -60,37 +70,15 @@ class TransferManager:
         send_transfer_range_dict: dict[int, ParamRange] | dict[int, Range],
         src_optimizer_tensor_info: OptimizerTensorInfo,
     ):
+        """Send (a dp-gather/scatter slice of) one param's optimizer state, then
+        release its storage. Transport is delegated to the communicator."""
         if send_transfer_range_dict is None or src_optimizer_tensor_info is None:
             return
-
-        src_model_param_range: ParamRange = src_optimizer_tensor_info.model_param_range
-        src_model_param_shape: torch.Size = src_model_param_range.to_torch_size()
-
-        # Dp-align : the param range is a Range object
-        if isinstance(list(send_transfer_range_dict.values())[0], Range):
-            src_model_param_range = Range(
-                0, src_optimizer_tensor_info.optimizer_tensors[0].nelement()
-            )
-            src_model_param_shape = -1
-
-        if self.fake_transfer:
-            for dst_rank in send_transfer_range_dict:
-                self.send(None, dst=dst_rank)
-            src_optimizer_tensor_info.release()
-            return
-
-        batch = self.communicator.batch_p2p()
-        for dst_rank, send_param_range in send_transfer_range_dict.items():
-            transfer_param_slices: Tuple[slice] = (
-                src_model_param_range.get_sub_range_slices(send_param_range)
-            )
-            for src_optimizer_tensor in src_optimizer_tensor_info.optimizer_tensors:
-                assert src_optimizer_tensor.nelement() == src_model_param_range.size
-                send_optimizer_tensor = src_optimizer_tensor.view(
-                    src_model_param_shape
-                )[transfer_param_slices]
-                batch.isend(send_optimizer_tensor, dst=dst_rank)
-        batch.wait()
+        send_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        self._collect_send(
+            send_transfer_range_dict, src_optimizer_tensor_info, send_tasks
+        )
+        self.communicator.transfer(send_tasks, {}, pack=self._pack)
         src_optimizer_tensor_info.release()
 
     def _recv_optimizer_tensors(
@@ -98,37 +86,23 @@ class TransferManager:
         recv_transfer_range_dict: dict[int, ParamRange],
         dst_optimizer_tensor_info: OptimizerTensorInfo,
     ):
+        """Rebuild the destination state then receive (a dp-gather/scatter slice
+        of) one param's optimizer state. Transport is delegated to the
+        communicator; non-contiguous targets are copied back here."""
         if recv_transfer_range_dict is None or dst_optimizer_tensor_info is None:
             return
         dst_optimizer_tensor_info.rebuild()
-        dst_model_param_range: ParamRange = dst_optimizer_tensor_info.model_param_range
-        dst_model_param_shape: torch.Size = dst_model_param_range.to_torch_size()
-
-        # Dp-align : the param range is a Range object
-        if isinstance(list(recv_transfer_range_dict.values())[0], Range):
-            dst_model_param_range = Range(
-                0, dst_optimizer_tensor_info.optimizer_tensors[0].nelement()
-            )
-            dst_model_param_shape = -1
-
-        if self.fake_transfer:
-            for src_rank in recv_transfer_range_dict:
-                self.recv(None, src=src_rank)
-            return
-
-        batch = self.communicator.batch_p2p()
-        for src_rank, recv_param_range in recv_transfer_range_dict.items():
-            transfer_param_slices: Tuple[slice] = (
-                dst_model_param_range.get_sub_range_slices(recv_param_range)
-            )
-
-            for dst_optimizer_tensor in dst_optimizer_tensor_info.optimizer_tensors:
-                assert dst_optimizer_tensor.nelement() == dst_model_param_range.size
-                recv_optimizer_tensor = dst_optimizer_tensor.view(
-                    dst_model_param_shape
-                )[transfer_param_slices]
-                batch.irecv(recv_optimizer_tensor, src=src_rank)
-        batch.wait()
+        recv_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        recv_copy_back: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        self._collect_recv(
+            recv_transfer_range_dict,
+            dst_optimizer_tensor_info,
+            recv_tasks,
+            recv_copy_back,
+        )
+        self.communicator.transfer({}, recv_tasks, pack=self._pack)
+        for recv_slice, recv_buffer in recv_copy_back:
+            recv_slice.data.copy_(recv_buffer)
 
     def transfer_word_embedding_and_output_layer(
         self, word_embedding: VirtualParam, output_layer: VirtualParam
@@ -209,66 +183,6 @@ class TransferManager:
             )
             src_optimizer_tensor_info.shuffle_swiglu(scale_up_ratio)
 
-    def _main_process(self, virtual_param: VirtualParam):
-        """Main Process. Execute transfer plan.
-
-        For sender:
-        1. Send tensors and release memory by the aligned_dp_rank
-        2. If this param has been gathered by dp-ranks, release padded optimizer tensor
-
-        For receiver:
-        1. Allocate memory for padded optimizer tensor in aligned_dp_rank
-        2. Receive tensors
-
-        .. note::
-            For survival-node, it might be the sender and receiver in the same time, and self-send and self-recv is allowed and which is implemented by tensor-copy.
-
-        .. note::
-            The call order of send_fn and recv_fn cannot be changed, otherwise it will cause a copy error on the surviving node.
-
-        .. note::
-            This process will only be executed on the aligned_dp_rank.
-        """
-        reshard_plan: ReshardPlan = virtual_param.reshard_plan
-
-        # Best-effort guard: when this rank holds both sides (self/survival
-        # transfer), the src and dst must carry the same ordered state set —
-        # _send/_recv zip optimizer_tensors positionally. No-op when only one
-        # side is present on this rank. Always holds for Adam (both = 3 states).
-        src_info = virtual_param.src_optimizer_tensor_info
-        dst_info = virtual_param.dst_optimizer_tensor_info
-        if src_info is not None and dst_info is not None:
-            assert src_info.state_names == dst_info.state_names, (
-                f"src/dst optimizer state set mismatch: {src_info.state_names} vs "
-                f"{dst_info.state_names}; heterogeneous state sets are unsupported."
-            )
-
-        # Step-1 : Send tensors
-        self._send_optimizer_tensors(
-            send_transfer_range_dict=reshard_plan.global_send_info.get(self._rank),
-            src_optimizer_tensor_info=virtual_param.src_optimizer_tensor_info,
-        )
-        if virtual_param.src_optimizer_tensor_info:
-            virtual_param.src_optimizer_tensor_info.release_padded_optimizer_tensor()
-
-        # Step-2 : Receive tensors
-        # Step-2.1 : Find the aligned_dp_rank for receiver
-        is_aligned_rank_for_receiver = (
-            reshard_plan.data_parallel_resharding_info.dst_aligned_global_rank
-            == self._rank
-        )
-        if not is_aligned_rank_for_receiver:
-            return
-
-        # Step-2.2 : Allocate memory for padded optimizer tensor in aligned_dp_rank
-        virtual_param.dst_optimizer_tensor_info.create_padded_optimizer_tensor()
-
-        # Step-2.3 : Receive tensors
-        self._recv_optimizer_tensors(
-            recv_transfer_range_dict=reshard_plan.global_recv_info.get(self._rank),
-            dst_optimizer_tensor_info=virtual_param.dst_optimizer_tensor_info,
-        )
-
     def _should_skip_virtual_param(self, virtual_param: VirtualParam) -> bool:
         if (
             not virtual_param.src_optimizer_tensor_info
@@ -298,125 +212,93 @@ class TransferManager:
             model_param_shape = -1
         return model_param_range, model_param_shape
 
-    def _collect_send_tasks_for_virtual_param(
+    def _collect_send(
         self,
-        virtual_param: VirtualParam,
+        send_transfer_range_dict: Dict[int, ParamRange] | Dict[int, Range],
+        optimizer_tensor_info: OptimizerTensorInfo,
         send_tasks: Dict[int, List[torch.Tensor]],
-        send_buffers: List[torch.Tensor],
-        src_to_release: List[OptimizerTensorInfo],
-        src_to_release_padded: List[OptimizerTensorInfo],
     ) -> None:
-        src_optimizer_tensor_info = virtual_param.src_optimizer_tensor_info
-        if src_optimizer_tensor_info is None:
-            return
-        src_to_release_padded.append(src_optimizer_tensor_info)
-
-        send_transfer_range_dict = virtual_param.reshard_plan.global_send_info.get(
-            self._rank
-        )
-        if send_transfer_range_dict is None:
-            return
-
+        """Append each cross-rank send slice to ``send_tasks[dst]``; self-rank
+        slices are copied immediately via :meth:`send`. Raw views are appended
+        (the communicator makes them contiguous / stages them as needed)."""
         if self.fake_transfer:
             for dst_rank in send_transfer_range_dict:
                 self.send(None, dst=dst_rank)
-            src_to_release.append(src_optimizer_tensor_info)
             return
 
-        src_model_param_range, src_model_param_shape = self._resolve_transfer_layout(
-            send_transfer_range_dict,
-            src_optimizer_tensor_info,
+        model_param_range, model_param_shape = self._resolve_transfer_layout(
+            send_transfer_range_dict, optimizer_tensor_info
         )
         for dst_rank, send_param_range in send_transfer_range_dict.items():
-            transfer_param_slices: Tuple[slice] = (
-                src_model_param_range.get_sub_range_slices(send_param_range)
+            transfer_param_slices = model_param_range.get_sub_range_slices(
+                send_param_range
             )
-            for src_optimizer_tensor in src_optimizer_tensor_info.optimizer_tensors:
-                assert src_optimizer_tensor.nelement() == src_model_param_range.size
-                send_optimizer_tensor = src_optimizer_tensor.view(
-                    src_model_param_shape
-                )[transfer_param_slices]
+            for optimizer_tensor in optimizer_tensor_info.optimizer_tensors:
+                assert optimizer_tensor.nelement() == model_param_range.size
+                send_slice = optimizer_tensor.view(model_param_shape)[
+                    transfer_param_slices
+                ]
                 if dst_rank == self._rank:
-                    self.send(send_optimizer_tensor, dst=dst_rank)
-                    continue
+                    self.send(send_slice, dst=dst_rank)
+                else:
+                    send_tasks[dst_rank].append(send_slice)
 
-                send_buffer = send_optimizer_tensor.contiguous()
-                send_buffers.append(send_buffer)
-                send_tasks[dst_rank].append(send_buffer)
-        src_to_release.append(src_optimizer_tensor_info)
-
-    def _collect_recv_tasks_for_virtual_param(
+    def _collect_recv(
         self,
-        virtual_param: VirtualParam,
+        recv_transfer_range_dict: Dict[int, ParamRange] | Dict[int, Range],
+        optimizer_tensor_info: OptimizerTensorInfo,
         recv_tasks: Dict[int, List[torch.Tensor]],
         recv_copy_back: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> None:
-        reshard_plan: ReshardPlan = virtual_param.reshard_plan
-        is_aligned_rank_for_receiver = (
-            reshard_plan.data_parallel_resharding_info.dst_aligned_global_rank
-            == self._rank
-        )
-        if not is_aligned_rank_for_receiver:
-            return
-
-        dst_optimizer_tensor_info = virtual_param.dst_optimizer_tensor_info
-        assert dst_optimizer_tensor_info is not None, (
-            f"rank {self._rank} is the aligned rank of param (name={virtual_param.name}), "
-            "but dst_optimizer_tensor_info is None."
-        )
-
-        recv_transfer_range_dict = reshard_plan.global_recv_info.get(self._rank)
-        assert recv_transfer_range_dict is not None, (
-            f"rank {self._rank} is the aligned rank of param (name={virtual_param.name}), "
-            "but recv_transfer_range_dict is None."
-        )
-
-        # Allocate memory for padded optimizer tensor in aligned_dp_rank.
-        dst_optimizer_tensor_info.create_padded_optimizer_tensor()
-        dst_optimizer_tensor_info.rebuild()
-        dst_model_param_range, dst_model_param_shape = self._resolve_transfer_layout(
-            recv_transfer_range_dict,
-            dst_optimizer_tensor_info,
-        )
-
+        """Append each cross-rank recv landing buffer to ``recv_tasks[src]``;
+        self-rank slices are filled immediately via :meth:`recv`. A
+        non-contiguous target gets a contiguous buffer plus a ``recv_copy_back``
+        entry the caller scatters back after the transfer."""
         if self.fake_transfer:
             for src_rank in recv_transfer_range_dict:
                 self.recv(None, src=src_rank)
             return
 
+        model_param_range, model_param_shape = self._resolve_transfer_layout(
+            recv_transfer_range_dict, optimizer_tensor_info
+        )
         for src_rank, recv_param_range in recv_transfer_range_dict.items():
-            transfer_param_slices: Tuple[slice] = (
-                dst_model_param_range.get_sub_range_slices(recv_param_range)
+            transfer_param_slices = model_param_range.get_sub_range_slices(
+                recv_param_range
             )
-            for dst_optimizer_tensor in dst_optimizer_tensor_info.optimizer_tensors:
-                assert dst_optimizer_tensor.nelement() == dst_model_param_range.size
-                recv_optimizer_tensor = dst_optimizer_tensor.view(
-                    dst_model_param_shape
-                )[transfer_param_slices]
+            for optimizer_tensor in optimizer_tensor_info.optimizer_tensors:
+                assert optimizer_tensor.nelement() == model_param_range.size
+                recv_slice = optimizer_tensor.view(model_param_shape)[
+                    transfer_param_slices
+                ]
                 if src_rank == self._rank:
-                    self.recv(recv_optimizer_tensor, src=src_rank)
+                    self.recv(recv_slice, src=src_rank)
                     continue
 
-                if recv_optimizer_tensor.is_contiguous():
-                    recv_buffer = recv_optimizer_tensor
+                if recv_slice.is_contiguous():
+                    recv_buffer = recv_slice
                 else:
                     recv_buffer = torch.empty_like(
-                        recv_optimizer_tensor,
-                        memory_format=torch.contiguous_format,
+                        recv_slice, memory_format=torch.contiguous_format
                     )
-                    recv_copy_back.append((recv_optimizer_tensor, recv_buffer))
-
+                    recv_copy_back.append((recv_slice, recv_buffer))
                 recv_tasks[src_rank].append(recv_buffer)
 
-    def _main_process_batch(self, virtual_params: List[VirtualParam]):
+    def _main_process(self, virtual_params: List[VirtualParam]):
+        """Execute the cross-rank transfer plan for every param.
+
+        Collect every send/recv slice into per-peer task dicts, hand them to the
+        communicator in one batched transfer, then scatter non-contiguous
+        receives and release sent storage. Self-rank slices (survival node that
+        is both sender and receiver) are copied during collection, in order, via
+        :meth:`send` / :meth:`recv`; cross-rank slices move through the
+        communicator.
+        """
         send_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
         recv_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
-        send_buffers: List[torch.Tensor] = []
         recv_copy_back: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        recv_unpack_tasks: List[Tuple[torch.Tensor, List[torch.Tensor]]] = []
         src_to_release: List[OptimizerTensorInfo] = []
         src_to_release_padded: List[OptimizerTensorInfo] = []
-
         timings: dict[str, float] | None = {} if self._log_transfer_timing else None
 
         with self._timed(timings, "Collect tasks"):
@@ -424,106 +306,66 @@ class TransferManager:
                 if self._should_skip_virtual_param(virtual_param):
                     continue
 
-                self._collect_send_tasks_for_virtual_param(
-                    virtual_param=virtual_param,
-                    send_tasks=send_tasks,
-                    send_buffers=send_buffers,
-                    src_to_release=src_to_release,
-                    src_to_release_padded=src_to_release_padded,
+                reshard_plan: ReshardPlan = virtual_param.reshard_plan
+                src_info = virtual_param.src_optimizer_tensor_info
+                dst_info = virtual_param.dst_optimizer_tensor_info
+
+                # When this rank holds both sides (self/survival transfer) src and
+                # dst must carry the same ordered state set -- slices are zipped
+                # positionally. Always holds for Adam (both = 3 states).
+                if src_info is not None and dst_info is not None:
+                    assert src_info.state_names == dst_info.state_names, (
+                        f"src/dst optimizer state set mismatch: {src_info.state_names} "
+                        f"vs {dst_info.state_names}; heterogeneous state sets are "
+                        "unsupported."
+                    )
+
+                # Sender side: collect cross-rank sends, schedule releases.
+                if src_info is not None:
+                    src_to_release_padded.append(src_info)
+                    send_range = reshard_plan.global_send_info.get(self._rank)
+                    if send_range is not None:
+                        self._collect_send(send_range, src_info, send_tasks)
+                        src_to_release.append(src_info)
+
+                # Receiver side (aligned rank only): allocate the padded buffer
+                # then collect cross-rank receives into it.
+                is_aligned_receiver = (
+                    reshard_plan.data_parallel_resharding_info.dst_aligned_global_rank
+                    == self._rank
                 )
-                self._collect_recv_tasks_for_virtual_param(
-                    virtual_param=virtual_param,
-                    recv_tasks=recv_tasks,
-                    recv_copy_back=recv_copy_back,
-                )
+                if is_aligned_receiver:
+                    assert dst_info is not None, (
+                        f"rank {self._rank} is the aligned recv rank of param "
+                        f"(name={virtual_param.name}) but dst_optimizer_tensor_info "
+                        "is None."
+                    )
+                    recv_range = reshard_plan.global_recv_info.get(self._rank)
+                    assert recv_range is not None, (
+                        f"rank {self._rank} is the aligned recv rank of param "
+                        f"(name={virtual_param.name}) but recv info is None."
+                    )
+                    dst_info.create_padded_optimizer_tensor()
+                    dst_info.rebuild()
+                    self._collect_recv(recv_range, dst_info, recv_tasks, recv_copy_back)
 
-        batch = self.communicator.batch_p2p()
-        world_size = torch.distributed.get_world_size()
-
-        def _pack_tensors(
-            peer_tensors: List[torch.Tensor], copy_to_buffer: bool = True
-        ) -> torch.Tensor:
-            first = peer_tensors[0]
-            for tensor in peer_tensors[1:]:
-                assert tensor.device == first.device, (
-                    "Peer tensors must be on the same device when packing. "
-                    f"Found {first.device} and {tensor.device}."
-                )
-
-            total_nbytes = sum(tensor.nbytes for tensor in peer_tensors)
-            packed = torch.empty(total_nbytes, dtype=torch.uint8, device=first.device)
-
-            if copy_to_buffer:
-                offset = 0
-                for tensor in peer_tensors:
-                    tensor_bytes = tensor.view(torch.uint8).reshape(-1)
-                    nbytes = tensor_bytes.numel()
-                    packed[offset : offset + nbytes].copy_(tensor_bytes)
-                    offset += nbytes
-            return packed
-
-        def _unpack_tensors(
-            packed: torch.Tensor, peer_tensors: List[torch.Tensor]
-        ) -> None:
-            """Inverse of :func:`_pack_tensors`: scatter ``packed`` back into
-            the original tensors in the same order they were packed."""
-            offset = 0
-            for tensor in peer_tensors:
-                tensor_bytes = tensor.view(torch.uint8).reshape(-1)
-                nbytes = tensor_bytes.numel()
-                tensor_bytes.copy_(packed[offset : offset + nbytes])
-                offset += nbytes
-
-        with self._timed(timings, "Pack peer tensors"):
-            num_steps = 1 << ((world_size - 1).bit_length())
-            for step in range(1, num_steps):
-                peer = self._rank ^ step
-                if peer >= world_size:
-                    continue
-
-                peer_sends = send_tasks.get(peer, [])
-                peer_recvs = recv_tasks.get(peer, [])
-                if not peer_sends and not peer_recvs:
-                    continue
-
-                packed_send_tensor = None
-                packed_recv_tensor = None
-                if peer_sends:
-                    packed_send_tensor = _pack_tensors(peer_sends)
-                if peer_recvs:
-                    packed_recv_tensor = _pack_tensors(peer_recvs, False)
-                    recv_unpack_tasks.append((packed_recv_tensor, peer_recvs))
-
-                # Order send/recv to avoid potential deadlocks: the lower-ranked
-                # peer enqueues send first, the higher-ranked peer enqueues recv
-                # first. ``BatchP2P`` preserves enqueue order in the op list.
-                if self._rank < peer:
-                    if packed_send_tensor is not None:
-                        batch.isend(packed_send_tensor, dst=peer)
-                    if packed_recv_tensor is not None:
-                        batch.irecv(packed_recv_tensor, src=peer)
-                else:
-                    if packed_recv_tensor is not None:
-                        batch.irecv(packed_recv_tensor, src=peer)
-                    if packed_send_tensor is not None:
-                        batch.isend(packed_send_tensor, dst=peer)
-
-        with self._timed(timings, "Real transfer"):
-            batch.wait()
-
-        with self._timed(timings, "Unpack recv tensors"):
-            for packed_recv_tensor, original_recv_tensors in recv_unpack_tasks:
-                _unpack_tensors(packed_recv_tensor, original_recv_tensors)
+        with self._timed(timings, "Transfer"):
+            self.communicator.transfer(
+                send_tasks,
+                recv_tasks,
+                pack=self._pack,
+                max_inflight_bytes=self._max_inflight_bytes,
+            )
 
         with self._timed(timings, "Copy recv tensors"):
-            for recv_optimizer_tensor, recv_buffer in recv_copy_back:
-                recv_optimizer_tensor.data.copy_(recv_buffer)
+            for recv_slice, recv_buffer in recv_copy_back:
+                recv_slice.data.copy_(recv_buffer)
 
         with self._timed(timings, "Release optimizer tensors"):
-            for src_optimizer_tensor_info in src_to_release:
-                src_optimizer_tensor_info.release()
-            for src_optimizer_tensor_info in src_to_release_padded:
-                src_optimizer_tensor_info.release_padded_optimizer_tensor()
+            for optimizer_tensor_info in src_to_release:
+                optimizer_tensor_info.release()
+            for optimizer_tensor_info in src_to_release_padded:
+                optimizer_tensor_info.release_padded_optimizer_tensor()
 
         if timings is not None and self._rank == 0:
             summary = "  ".join(f"{name}: {ms:.2f}ms" for name, ms in timings.items())
@@ -634,10 +476,7 @@ class TransferManager:
                 process_fn(virtual_param)
 
         process_virtual_params(self._pre_process)
-        if self.use_asyncbuffer_p2p:
-            self._main_process_batch(virtual_param_space.all_virtual_params)
-        else:
-            process_virtual_params(self._main_process)
+        self._main_process(virtual_param_space.all_virtual_params)
         process_virtual_params(self._post_process)
         self.transfer_word_embedding_and_output_layer(
             virtual_param_space.all_virtual_params[0],
