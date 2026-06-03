@@ -1,6 +1,7 @@
 import os
 from collections import defaultdict
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Dict, List, Tuple
 
 import torch
@@ -17,11 +18,9 @@ from ..megatron_manager.training_state import (
 from ..resharding.resharding import ReshardPlan
 from ..resharding.resharding_metadata import OptimizerTensorInfo
 from ..resharding.resharding_pp import LayerType, ParamPositionAttr
-from ..resharding.util import ParamRange, Range
+from ..resharding.util import ParamRange, Range, Timer
 from ..resharding.virtual_param import VirtualParam, VirtualParamSpace
 from .communicator import Communicator
-
-from megatron.core.timers import Timers as MegatronTimers
 
 
 class TransferManager:
@@ -32,11 +31,25 @@ class TransferManager:
         self.recv = self.communicator.recv
         self.broadcast = self.communicator.broadcast
         self.fake_transfer = False
-        self._transfer_timers = MegatronTimers(
-            log_level=int(os.getenv("ELASTIC_TRANSFER_LOG_LEVEL", "1")),
-            log_option="minmax",
-        )
+        # When enabled, each phase of the batched transfer is timed (CUDA-
+        # synchronized) and the per-phase durations are printed on rank 0.
+        # Disabled => the timing context managers are no-ops (zero overhead).
+        self._log_transfer_timing = os.getenv("ELASTIC_TRANSFER_LOG_LEVEL", "1") != "0"
         self.use_asyncbuffer_p2p = os.getenv("ELASTIC_USE_ASYNCBUFFER_P2P", "0") == "1"
+
+    @contextmanager
+    def _timed(self, timings: dict[str, float] | None, name: str):
+        """Time the wrapped block into ``timings[name]`` (milliseconds).
+
+        A no-op when ``timings`` is None, so timing adds no overhead (and no
+        ``cuda.synchronize``) when disabled.
+        """
+        if timings is None:
+            yield
+            return
+        with Timer() as timer:
+            yield
+        timings[name] = timer.elapsed
 
     def set_fake_transfer(self, fake_transfer: bool):
         self.fake_transfer = fake_transfer
@@ -404,24 +417,25 @@ class TransferManager:
         src_to_release: List[OptimizerTensorInfo] = []
         src_to_release_padded: List[OptimizerTensorInfo] = []
 
-        self._transfer_timers("Main process batch", log_level=0).start()
-        for virtual_param in virtual_params:
-            if self._should_skip_virtual_param(virtual_param):
-                continue
+        timings: dict[str, float] | None = {} if self._log_transfer_timing else None
 
-            self._collect_send_tasks_for_virtual_param(
-                virtual_param=virtual_param,
-                send_tasks=send_tasks,
-                send_buffers=send_buffers,
-                src_to_release=src_to_release,
-                src_to_release_padded=src_to_release_padded,
-            )
-            self._collect_recv_tasks_for_virtual_param(
-                virtual_param=virtual_param,
-                recv_tasks=recv_tasks,
-                recv_copy_back=recv_copy_back,
-            )
-        self._transfer_timers("Main process batch").stop()
+        with self._timed(timings, "Collect tasks"):
+            for virtual_param in virtual_params:
+                if self._should_skip_virtual_param(virtual_param):
+                    continue
+
+                self._collect_send_tasks_for_virtual_param(
+                    virtual_param=virtual_param,
+                    send_tasks=send_tasks,
+                    send_buffers=send_buffers,
+                    src_to_release=src_to_release,
+                    src_to_release_padded=src_to_release_padded,
+                )
+                self._collect_recv_tasks_for_virtual_param(
+                    virtual_param=virtual_param,
+                    recv_tasks=recv_tasks,
+                    recv_copy_back=recv_copy_back,
+                )
 
         batch = self.communicator.batch_p2p()
         world_size = torch.distributed.get_world_size()
@@ -460,62 +474,60 @@ class TransferManager:
                 tensor_bytes.copy_(packed[offset : offset + nbytes])
                 offset += nbytes
 
-        self._transfer_timers("Pack peer tensors", log_level=1).start()
-        num_steps = 1 << ((world_size - 1).bit_length())
-        for step in range(1, num_steps):
-            peer = self._rank ^ step
-            if peer >= world_size:
-                continue
+        with self._timed(timings, "Pack peer tensors"):
+            num_steps = 1 << ((world_size - 1).bit_length())
+            for step in range(1, num_steps):
+                peer = self._rank ^ step
+                if peer >= world_size:
+                    continue
 
-            peer_sends = send_tasks.get(peer, [])
-            peer_recvs = recv_tasks.get(peer, [])
-            if not peer_sends and not peer_recvs:
-                continue
+                peer_sends = send_tasks.get(peer, [])
+                peer_recvs = recv_tasks.get(peer, [])
+                if not peer_sends and not peer_recvs:
+                    continue
 
-            packed_send_tensor = None
-            packed_recv_tensor = None
-            if peer_sends:
-                packed_send_tensor = _pack_tensors(peer_sends)
-            if peer_recvs:
-                packed_recv_tensor = _pack_tensors(peer_recvs, False)
-                recv_unpack_tasks.append((packed_recv_tensor, peer_recvs))
+                packed_send_tensor = None
+                packed_recv_tensor = None
+                if peer_sends:
+                    packed_send_tensor = _pack_tensors(peer_sends)
+                if peer_recvs:
+                    packed_recv_tensor = _pack_tensors(peer_recvs, False)
+                    recv_unpack_tasks.append((packed_recv_tensor, peer_recvs))
 
-            # Order send/recv to avoid potential deadlocks: the lower-ranked
-            # peer enqueues send first, the higher-ranked peer enqueues recv
-            # first. ``BatchP2P`` preserves enqueue order in the op list.
-            if self._rank < peer:
-                if packed_send_tensor is not None:
-                    batch.isend(packed_send_tensor, dst=peer)
-                if packed_recv_tensor is not None:
-                    batch.irecv(packed_recv_tensor, src=peer)
-            else:
-                if packed_recv_tensor is not None:
-                    batch.irecv(packed_recv_tensor, src=peer)
-                if packed_send_tensor is not None:
-                    batch.isend(packed_send_tensor, dst=peer)
-        self._transfer_timers("Pack peer tensors").stop()
+                # Order send/recv to avoid potential deadlocks: the lower-ranked
+                # peer enqueues send first, the higher-ranked peer enqueues recv
+                # first. ``BatchP2P`` preserves enqueue order in the op list.
+                if self._rank < peer:
+                    if packed_send_tensor is not None:
+                        batch.isend(packed_send_tensor, dst=peer)
+                    if packed_recv_tensor is not None:
+                        batch.irecv(packed_recv_tensor, src=peer)
+                else:
+                    if packed_recv_tensor is not None:
+                        batch.irecv(packed_recv_tensor, src=peer)
+                    if packed_send_tensor is not None:
+                        batch.isend(packed_send_tensor, dst=peer)
 
-        self._transfer_timers("Real transfer", log_level=1).start()
-        batch.wait()
-        self._transfer_timers("Real transfer").stop()
+        with self._timed(timings, "Real transfer"):
+            batch.wait()
 
-        self._transfer_timers("Unpack recv tensors", log_level=1).start()
-        for packed_recv_tensor, original_recv_tensors in recv_unpack_tasks:
-            _unpack_tensors(packed_recv_tensor, original_recv_tensors)
-        self._transfer_timers("Unpack recv tensors").stop()
-        
-        self._transfer_timers("Copy recv tensors", log_level=1).start()
-        for recv_optimizer_tensor, recv_buffer in recv_copy_back:
-            recv_optimizer_tensor.data.copy_(recv_buffer)
-        self._transfer_timers("Copy recv tensors").stop()
+        with self._timed(timings, "Unpack recv tensors"):
+            for packed_recv_tensor, original_recv_tensors in recv_unpack_tasks:
+                _unpack_tensors(packed_recv_tensor, original_recv_tensors)
 
-        self._transfer_timers("Release optimizer tensors", log_level=1).start()
-        for src_optimizer_tensor_info in src_to_release:
-            src_optimizer_tensor_info.release()
-        for src_optimizer_tensor_info in src_to_release_padded:
-            src_optimizer_tensor_info.release_padded_optimizer_tensor()
-        self._transfer_timers("Release optimizer tensors").stop()
-        self._transfer_timers.log(names=None, rank=0)
+        with self._timed(timings, "Copy recv tensors"):
+            for recv_optimizer_tensor, recv_buffer in recv_copy_back:
+                recv_optimizer_tensor.data.copy_(recv_buffer)
+
+        with self._timed(timings, "Release optimizer tensors"):
+            for src_optimizer_tensor_info in src_to_release:
+                src_optimizer_tensor_info.release()
+            for src_optimizer_tensor_info in src_to_release_padded:
+                src_optimizer_tensor_info.release_padded_optimizer_tensor()
+
+        if timings is not None and self._rank == 0:
+            summary = "  ".join(f"{name}: {ms:.2f}ms" for name, ms in timings.items())
+            print(f"[ElasticMegatron-Transfer] {summary}", flush=True)
 
     def _post_process(self, virtual_param: VirtualParam):
         """Post Process. For receiver, unshuffle swiglu and scatter param to dp ranks(ZeRO-1), and release all padded optimizer tensors."""
