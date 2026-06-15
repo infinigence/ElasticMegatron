@@ -196,7 +196,9 @@ class _ElasticProcessGroupManager:
         return elastic_group
 
     def nccl_group_recreate(self):
-        for (ranks_set, backend), group in self._pg_cache.items():
+        for (ranks_set, backend), group in sorted(
+            self._pg_cache.items(), key=lambda kv: (sorted(kv[0][0]), kv[0][1])
+        ):
             if backend != "nccl" or len(ranks_set) <= 1:
                 continue
             group.destroy()
