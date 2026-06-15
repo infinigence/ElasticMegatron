@@ -202,13 +202,14 @@ class MegatronStateManager:
                 f"{is_meta_device=} but {src_megatron_state.training_state.is_meta_device=}"
             )
             src_megatron_state.training_state.release_model()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # Setup dst training state
         if (
             rank < dst_megatron_state.world_size
             and dst_megatron_state.training_state is None
         ):
-            torch.cuda.empty_cache()
             dst_megatron_state.training_state = TrainingState.setup_model_and_optimizer(
                 is_meta_device=is_meta_device
             )
@@ -216,6 +217,8 @@ class MegatronStateManager:
                 dst_megatron_state.parallel_strategy, offload_opt_tensors=True
             )
             dst_megatron_state.training_state.release_model()
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         return src_megatron_state, dst_megatron_state, union_world_group
 

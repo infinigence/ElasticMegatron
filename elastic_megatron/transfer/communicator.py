@@ -1,5 +1,7 @@
 import queue
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
@@ -280,6 +282,26 @@ class BatchedTransfer:
 
     def __init__(self, communicator: "Communicator"):
         self._comm = communicator
+        # Per-transfer phase timings (ms), populated when collect_phase_ms=True:
+        # pack (H2D stage-in), comm (NCCL), unpack (D2H stage-out). Input data
+        # for the overlap design (docs/buffer_opt/cpu-adam-overlap.md), which
+        # requires measuring the three segments before building any pipeline.
+        self.last_phase_ms: dict[str, float] | None = None
+
+    @contextmanager
+    def _phase(self, name: str):
+        """Accumulate the wrapped block's duration into last_phase_ms[name]
+        (CUDA-synced). No-op (and no synchronize) when timing is off."""
+        if self.last_phase_ms is None:
+            yield
+            return
+        torch.cuda.synchronize()
+        t0 = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            torch.cuda.synchronize()
+            self.last_phase_ms[name] += (time.perf_counter_ns() - t0) / 1e6
 
     def transfer(
         self,
@@ -288,6 +310,7 @@ class BatchedTransfer:
         *,
         pack: bool = True,
         max_inflight_bytes: int | None = None,
+        collect_phase_ms: bool = False,
     ) -> None:
         """Move a batch of cross-rank tensor slices.
 
@@ -312,6 +335,10 @@ class BatchedTransfer:
         if comm._build_nccl_connection_only:
             return
 
+        self.last_phase_ms = (
+            {"pack": 0.0, "comm": 0.0, "unpack": 0.0} if collect_phase_ms else None
+        )
+
         world_size = torch.distributed.get_world_size()
 
         # The XOR "butterfly" pairs ranks step by step; both ranks of a pair
@@ -327,22 +354,27 @@ class BatchedTransfer:
         recv_unpack: List[Tuple[torch.Tensor, List[torch.Tensor]]] = []
 
         def flush() -> None:
-            batch.wait()
-            for packed, tensors in recv_unpack:
-                self._unpack_into(packed, tensors)
+            with self._phase("comm"):
+                batch.wait()
+            with self._phase("unpack"):
+                for packed, tensors in recv_unpack:
+                    self._unpack_into(packed, tensors)
             recv_unpack.clear()
 
         for step in range(1, num_steps):
             peer = comm._rank ^ step
             if peer < world_size:
-                self._enqueue_peer(
-                    batch,
-                    peer,
-                    send_tasks.get(peer),
-                    recv_tasks.get(peer),
-                    pack,
-                    recv_unpack,
-                )
+                # Packing (and BatchP2P's per-tensor CPU->GPU staging on the
+                # non-pack path) happens inside _enqueue_peer => "pack" phase.
+                with self._phase("pack"):
+                    self._enqueue_peer(
+                        batch,
+                        peer,
+                        send_tasks.get(peer),
+                        recv_tasks.get(peer),
+                        pack,
+                        recv_unpack,
+                    )
             if flush_every is not None and step % flush_every == 0:
                 flush()
         flush()

@@ -356,7 +356,11 @@ class TransferManager:
                 recv_tasks,
                 pack=self._pack,
                 max_inflight_bytes=self._max_inflight_bytes,
+                collect_phase_ms=timings is not None,
             )
+        if timings is not None and self.batched_transfer.last_phase_ms:
+            for phase, ms in self.batched_transfer.last_phase_ms.items():
+                timings[f"Transfer/{phase}"] = ms
 
         with self._timed(timings, "Copy recv tensors"):
             for recv_slice, recv_buffer in recv_copy_back:
