@@ -20,6 +20,7 @@ from ..resharding.resharding_metadata import OptimizerTensorInfo
 from ..resharding.resharding_pp import LayerType, ParamPositionAttr
 from ..resharding.util import ParamRange, Range, Timer
 from ..resharding.virtual_param import VirtualParam, VirtualParamSpace
+from .chunk_schedule import STAGING_CAP_DEFAULT, derive_staging_cap
 from .communicator import BatchedTransfer, Communicator
 
 
@@ -39,14 +40,55 @@ class TransferManager:
         # Pack each peer's slices into one buffer before NCCL (fast path) vs one
         # p2p op per slice. The packed buffer lives on GPU, so packing doubles as
         # CPU<->GPU staging for offloaded (HybridDeviceOptimizer) state.
-        self._pack = os.getenv("ELASTIC_USE_ASYNCBUFFER_P2P", "0") == "1"
-        # Optional cap on bytes in flight per batch_isend_irecv flush; bounds the
-        # GPU staging footprint. Unset => one batch for the whole transfer. Must
-        # be identical on every rank: it drives a step-aligned flush stride, and
-        # mismatched values would desync paired ranks.
-        self._max_inflight_bytes = (
-            int(os.getenv("ELASTIC_MAX_INFLIGHT_BYTES", "0")) or None
+        self._pack = os.getenv("ELASTIC_USE_ASYNCBUFFER_P2P", "1") == "1"
+        # Byte cap per staging chunk in the packed path; staging residency is
+        # bounded by ~2x this value. Resolved per reshard in _resolve_staging_cap
+        # right before the exchange. ELASTIC_STAGING_CAP_MODE selects the source:
+        #   free (default): smallest current free GPU memory across the union
+        #     ranks / 2, clamped to [1 GiB, 8 GiB] — the only mode that reflects
+        #     real device memory, including co-tenant processes on the card.
+        #   fixed: a 2 GiB constant.
+        # ELASTIC_MAX_INFLIGHT_BYTES, when set, overrides the mode: a positive
+        # value is the exact cap; <=0 disables chunking (one chunk per peer,
+        # legacy residency). The cap is identical on every rank — both ends of a
+        # pair derive chunk counts from it.
+        self._cap_mode = os.getenv("ELASTIC_STAGING_CAP_MODE", "free")
+        raw_inflight = os.getenv("ELASTIC_MAX_INFLIGHT_BYTES")
+        self._explicit_inflight: int | None = (
+            int(raw_inflight) if raw_inflight is not None else None
         )
+        self._max_inflight_bytes: int | None = None
+
+    def _resolve_staging_cap(self) -> int | None:
+        """Per-chunk staging byte cap for this reshard, identical on every rank.
+
+        ELASTIC_MAX_INFLIGHT_BYTES, when set, wins (positive = exact cap; <=0 =
+        one chunk per peer). Otherwise ELASTIC_STAGING_CAP_MODE picks the source:
+        ``fixed`` => a 2 GiB constant; ``free`` (default) => the smallest current
+        free GPU memory across the union ranks (one MIN all-reduce; the no-group
+        collective lands on the union via the dist patch) / 2, clamped to
+        [1 GiB, 8 GiB]. Called right before the exchange so the free reading
+        reflects the post-release_model state of the card.
+        """
+        if self._explicit_inflight is not None:
+            return self._explicit_inflight
+        if self._cap_mode == "fixed":
+            return STAGING_CAP_DEFAULT
+        free_bytes = torch.cuda.mem_get_info()[0]
+        min_free = torch.tensor(
+            [free_bytes], device=torch.cuda.current_device(), dtype=torch.int64
+        )
+        torch.distributed.all_reduce(min_free, op=torch.distributed.ReduceOp.MIN)
+        min_free_bytes = int(min_free.item())
+        cap = derive_staging_cap(min_free_bytes)
+        if self._rank == 0 and 2 * cap > min_free_bytes:
+            print(
+                f"[ElasticMegatron-Transfer] staging cap {cap / (1 << 20):.0f} MiB x2 "
+                f"exceeds min free {min_free_bytes / (1 << 20):.0f} MiB across union "
+                f"ranks — staging may over-commit on a tight/co-tenanted card.",
+                flush=True,
+            )
+        return cap
 
     @contextmanager
     def _timed(self, timings: dict[str, float] | None, name: str):
@@ -79,7 +121,9 @@ class TransferManager:
         self._collect_send(
             send_transfer_range_dict, src_optimizer_tensor_info, send_tasks
         )
-        self.batched_transfer.transfer(send_tasks, {}, pack=self._pack)
+        self.batched_transfer.transfer(
+            send_tasks, {}, pack=self._pack, max_inflight_bytes=self._max_inflight_bytes
+        )
         src_optimizer_tensor_info.release()
 
     def _recv_optimizer_tensors(
@@ -101,7 +145,9 @@ class TransferManager:
             recv_tasks,
             recv_copy_back,
         )
-        self.batched_transfer.transfer({}, recv_tasks, pack=self._pack)
+        self.batched_transfer.transfer(
+            {}, recv_tasks, pack=self._pack, max_inflight_bytes=self._max_inflight_bytes
+        )
         for recv_slice, recv_buffer in recv_copy_back:
             recv_slice.data.copy_(recv_buffer)
 
@@ -438,7 +484,9 @@ class TransferManager:
         torch.distributed.barrier()
 
     def transfer_optimizer_tensors(
-        self, virtual_param_space: VirtualParamSpace, use_block_and_print: bool = False
+        self,
+        virtual_param_space: VirtualParamSpace,
+        use_block_and_print: bool = False,
     ):
         """Transfer all optimizer tensors.
 
@@ -455,6 +503,18 @@ class TransferManager:
         Note.
         The above three steps are strictly synchronized, so if the transmission is carried out according to the way of each parameter traversing the above three steps, it will cause blockage.
         """
+
+        # Resolve the staging-chunk cap for THIS reshard, right before the
+        # exchange (after release_model + cache reclaim, inside the union world
+        # group). Identical on every rank.
+        self._max_inflight_bytes = self._resolve_staging_cap()
+        if self._pack and self._rank == 0:
+            cap = self._max_inflight_bytes
+            shown = "no-split" if not cap or cap <= 0 else f"{cap / (1 << 20):.0f} MiB"
+            print(
+                f"[ElasticMegatron-Transfer] staging cap (mode={self._cap_mode}): {shown}",
+                flush=True,
+            )
 
         def process_virtual_params(process_fn: Callable):
             assert callable(process_fn), "process_fn must be a callable"

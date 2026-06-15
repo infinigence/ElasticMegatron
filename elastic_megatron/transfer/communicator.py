@@ -1,13 +1,15 @@
 import queue
 import time
 from collections import defaultdict
-from contextlib import contextmanager
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
+
+from .chunk_schedule import chunk_ranges, slice_spans
 
 
 @dataclass
@@ -273,20 +275,170 @@ class BatchedTransfer:
     :class:`Communicator`.
 
     :meth:`transfer` is the single transport entry point for a reshard's main
-    exchange: it owns byte packing, CPU<->GPU staging, XOR-butterfly peer
-    ordering, byte accounting and optional memory bucketing. It **composes** (not
-    subclasses) :class:`Communicator` for the per-op primitives (self-copy,
-    connection building, accounting) via :class:`BatchP2P`, keeping
-    ``Communicator`` itself a thin primitive layer.
+    exchange. The packed path coalesces each peer's slices through a pair of
+    REUSED uint8 GPU staging buffers, split into byte chunks of at most
+    ``max_inflight_bytes`` — so staging residency is bounded by ~2x the cap
+    regardless of model size. Chunk boundaries are derived independently on both
+    ranks of a pair from the same ordered slice list (see chunk_schedule.py), so
+    the packed path needs no collective exchange.
     """
 
     def __init__(self, communicator: "Communicator"):
         self._comm = communicator
         # Per-transfer phase timings (ms), populated when collect_phase_ms=True:
         # pack (H2D stage-in), comm (NCCL), unpack (D2H stage-out). Input data
-        # for the overlap design (docs/buffer_opt/cpu-adam-overlap.md), which
-        # requires measuring the three segments before building any pipeline.
+        # for the next-phase overlap design (docs/buffer_opt/cpu-adam-overlap.md).
         self.last_phase_ms: dict[str, float] | None = None
+
+    def transfer(
+        self,
+        send_tasks: Dict[int, List[torch.Tensor]],
+        recv_tasks: Dict[int, List[torch.Tensor]],
+        *,
+        pack: bool = True,
+        max_inflight_bytes: int | None = None,
+        collect_phase_ms: bool = False,
+    ) -> None:
+        """Move a batch of cross-rank tensor slices.
+
+        ``send_tasks[peer]`` / ``recv_tasks[peer]`` are ordered lists of the
+        slices to send to / receive from ``peer`` (recv entries are contiguous
+        landing buffers; send entries may be strided views). Self-rank copies
+        are issued by the caller via ``Communicator.send`` / ``recv``.
+
+        With ``pack``, each peer pair exchanges in rounds: every round packs at
+        most ``max_inflight_bytes`` bytes per direction into a reused GPU
+        staging buffer and issues one ``batch_isend_irecv``. The pack/unpack
+        byte copies double as CPU<->GPU staging for offloaded (HDO) state.
+        ``max_inflight_bytes`` must be identical on every rank (both ends must
+        derive the same chunk count); None/<=0 => single chunk per peer
+        (legacy residency).
+        A smaller cap lowers staging residency but serialises the exchange into
+        more rounds (one ``batch_isend_irecv`` + wait per round) — latency
+        rises roughly with ceil(bytes/cap); pick the cap to fit the memory
+        budget, not smaller. Without ``pack`` each slice is a separate,
+        individually staged p2p op in one whole-exchange batch
+        (``max_inflight_bytes`` is ignored on this path; legacy debug fallback).
+        """
+        comm = self._comm
+        # In fake_transfer mode the caller's collectors have already built the
+        # NCCL connections and pass empty task dicts; nothing to move.
+        if comm._build_nccl_connection_only:
+            return
+
+        self.last_phase_ms = (
+            {"pack": 0.0, "comm": 0.0, "unpack": 0.0} if collect_phase_ms else None
+        )
+
+        world_size = torch.distributed.get_world_size()
+        # The XOR "butterfly" pairs ranks step by step; both ranks of a pair
+        # meet at the same step. num_steps rounds up to the next power of two;
+        # out-of-range peers are skipped — every real pair still meets once.
+        num_steps = 1 << ((world_size - 1).bit_length())
+
+        if not pack:
+            batch = comm.batch_p2p()
+            for step in range(1, num_steps):
+                peer = comm._rank ^ step
+                if peer >= world_size:
+                    continue
+                self._enqueue_unpacked(
+                    batch, peer, send_tasks.get(peer), recv_tasks.get(peer)
+                )
+            with self._phase("comm"):
+                batch.wait()
+            return
+
+        # Reused staging buffers, sized lazily to the largest chunk seen and
+        # dropped at the end of the transfer (freed back to the cached pool;
+        # the window-end empty_cache in elastic_manager.reshard reclaims them).
+        stage_bufs: dict[str, torch.Tensor] = {}
+
+        def stage(kind: str, nbytes: int) -> torch.Tensor:
+            buf = stage_bufs.get(kind)
+            if buf is None or buf.numel() < nbytes:
+                stage_bufs[kind] = buf = torch.empty(
+                    nbytes, dtype=torch.uint8, device=torch.cuda.current_device()
+                )
+            return buf[:nbytes]
+
+        for step in range(1, num_steps):
+            peer = comm._rank ^ step
+            if peer >= world_size:
+                continue
+            peer_sends = send_tasks.get(peer) or []
+            peer_recvs = recv_tasks.get(peer) or []
+            if not peer_sends and not peer_recvs:
+                continue
+
+            # Byte views once per peer. .contiguous() may materialise a strided
+            # send view (same cost as the old whole-buffer pack); recv landings are
+            # contiguous by contract, so their views are zero-copy.
+            send_bytes = [
+                t.contiguous().view(torch.uint8).reshape(-1) for t in peer_sends
+            ]
+            recv_bytes = [t.view(torch.uint8).reshape(-1) for t in peer_recvs]
+            send_sizes = [b.numel() for b in send_bytes]
+            recv_sizes = [b.numel() for b in recv_bytes]
+
+            send_chunks = chunk_ranges(sum(send_sizes), max_inflight_bytes)
+            recv_chunks = chunk_ranges(sum(recv_sizes), max_inflight_bytes)
+            # A's send list to B IS B's landing list from A (same slices, same
+            # order), so both ends compute identical chunk counts per direction
+            # — the round count below agrees without any exchange.
+            for r in range(max(len(send_chunks), len(recv_chunks))):
+                s_chunk = send_chunks[r] if r < len(send_chunks) else None
+                r_chunk = recv_chunks[r] if r < len(recv_chunks) else None
+                s_stage = r_stage = None
+                if s_chunk is not None:
+                    s_stage = stage("send", s_chunk[1] - s_chunk[0])
+                    with self._phase("pack"):
+                        self._pack_chunk(send_bytes, send_sizes, s_chunk, s_stage)
+                if r_chunk is not None:
+                    r_stage = stage("recv", r_chunk[1] - r_chunk[0])
+
+                batch = comm.batch_p2p()
+                # Lower-ranked peer enqueues sends first, higher-ranked recvs
+                # first; batch_isend_irecv preserves enqueue order — no deadlock.
+                if comm._rank < peer:
+                    if s_stage is not None:
+                        batch.isend(s_stage, dst=peer)
+                    if r_stage is not None:
+                        batch.irecv(r_stage, src=peer)
+                else:
+                    if r_stage is not None:
+                        batch.irecv(r_stage, src=peer)
+                    if s_stage is not None:
+                        batch.isend(s_stage, dst=peer)
+                with self._phase("comm"):
+                    batch.wait()
+                # wait() orders the default stream after the NCCL ops, so both
+                # the unpack below and the next round's repack into the same
+                # staging buffer are stream-ordered — reuse is safe without a
+                # host sync.
+                if r_chunk is not None:
+                    with self._phase("unpack"):
+                        self._unpack_chunk(recv_bytes, recv_sizes, r_chunk, r_stage)
+
+    def _enqueue_unpacked(
+        self,
+        batch: BatchP2P,
+        peer: int,
+        peer_sends: List[torch.Tensor] | None,
+        peer_recvs: List[torch.Tensor] | None,
+    ) -> None:
+        if not peer_sends and not peer_recvs:
+            return
+        if self._comm._rank < peer:
+            for tensor in peer_sends or []:
+                batch.isend(tensor, dst=peer)
+            for tensor in peer_recvs or []:
+                batch.irecv(tensor, src=peer)
+        else:
+            for tensor in peer_recvs or []:
+                batch.irecv(tensor, src=peer)
+            for tensor in peer_sends or []:
+                batch.isend(tensor, dst=peer)
 
     @contextmanager
     def _phase(self, name: str):
@@ -303,183 +455,37 @@ class BatchedTransfer:
             torch.cuda.synchronize()
             self.last_phase_ms[name] += (time.perf_counter_ns() - t0) / 1e6
 
-    def transfer(
-        self,
-        send_tasks: Dict[int, List[torch.Tensor]],
-        recv_tasks: Dict[int, List[torch.Tensor]],
-        *,
-        pack: bool = True,
-        max_inflight_bytes: int | None = None,
-        collect_phase_ms: bool = False,
+    @staticmethod
+    def _pack_chunk(
+        byte_views: List[torch.Tensor],
+        sizes: List[int],
+        chunk: Tuple[int, int],
+        stage: torch.Tensor,
     ) -> None:
-        """Move a batch of cross-rank tensor slices.
-
-        ``send_tasks[peer]`` / ``recv_tasks[peer]`` are ordered lists of the
-        slices to send to / receive from ``peer`` (recv entries are contiguous
-        landing buffers; send entries may be strided views that this makes
-        contiguous). Peers must differ from this rank -- self-rank copies are
-        issued by the caller via ``Communicator.send`` / ``recv`` so they keep
-        their collection order.
-
-        With ``pack`` the slices for a peer are coalesced into one GPU ``uint8``
-        buffer (the pack/unpack copies double as the CPU<->GPU staging for
-        offloaded state); without it each slice is a separate, individually
-        staged p2p op. ``max_inflight_bytes`` (default None => one
-        ``batch_isend_irecv`` for the whole exchange) caps the bytes per flush;
-        flush points are step-aligned across ranks so paired ranks stay in sync.
-        """
-        comm = self._comm
-        # In fake_transfer mode the caller's collectors have already built the
-        # NCCL connections (via send(None)/recv(None)) and pass empty task dicts,
-        # so there is nothing to move here.
-        if comm._build_nccl_connection_only:
-            return
-
-        self.last_phase_ms = (
-            {"pack": 0.0, "comm": 0.0, "unpack": 0.0} if collect_phase_ms else None
-        )
-
-        world_size = torch.distributed.get_world_size()
-
-        # The XOR "butterfly" pairs ranks step by step; both ranks of a pair
-        # meet at the same step, so the schedule is symmetric. num_steps rounds
-        # up to the next power of two, so out-of-range peers (peer >= world_size)
-        # are skipped -- every real pair (a, b) still meets once, at step a ^ b.
-        num_steps = 1 << ((world_size - 1).bit_length())
-        flush_every = self._flush_stride(
-            world_size, num_steps, send_tasks, recv_tasks, max_inflight_bytes
-        )
-
-        batch = comm.batch_p2p()
-        recv_unpack: List[Tuple[torch.Tensor, List[torch.Tensor]]] = []
-
-        def flush() -> None:
-            with self._phase("comm"):
-                batch.wait()
-            with self._phase("unpack"):
-                for packed, tensors in recv_unpack:
-                    self._unpack_into(packed, tensors)
-            recv_unpack.clear()
-
-        for step in range(1, num_steps):
-            peer = comm._rank ^ step
-            if peer < world_size:
-                # Packing (and BatchP2P's per-tensor CPU->GPU staging on the
-                # non-pack path) happens inside _enqueue_peer => "pack" phase.
-                with self._phase("pack"):
-                    self._enqueue_peer(
-                        batch,
-                        peer,
-                        send_tasks.get(peer),
-                        recv_tasks.get(peer),
-                        pack,
-                        recv_unpack,
-                    )
-            if flush_every is not None and step % flush_every == 0:
-                flush()
-        flush()
-
-    def _enqueue_peer(
-        self,
-        batch: BatchP2P,
-        peer: int,
-        peer_sends: List[torch.Tensor] | None,
-        peer_recvs: List[torch.Tensor] | None,
-        pack: bool,
-        recv_unpack: List[Tuple[torch.Tensor, List[torch.Tensor]]],
-    ) -> None:
-        if not peer_sends and not peer_recvs:
-            return
-
-        if pack:
-            send_items = [self._pack_from(peer_sends)] if peer_sends else []
-            recv_items = []
-            if peer_recvs:
-                recv_packed = self._alloc_packed(peer_recvs)
-                recv_unpack.append((recv_packed, peer_recvs))
-                recv_items = [recv_packed]
-        else:
-            send_items = peer_sends or []
-            recv_items = peer_recvs or []
-
-        # Lower-ranked peer enqueues sends first, higher-ranked enqueues recvs
-        # first; batch_isend_irecv preserves enqueue order, avoiding deadlock.
-        if self._comm._rank < peer:
-            for tensor in send_items:
-                batch.isend(tensor, dst=peer)
-            for tensor in recv_items:
-                batch.irecv(tensor, src=peer)
-        else:
-            for tensor in recv_items:
-                batch.irecv(tensor, src=peer)
-            for tensor in send_items:
-                batch.isend(tensor, dst=peer)
-
-    def _flush_stride(
-        self,
-        world_size: int,
-        num_steps: int,
-        send_tasks: Dict[int, List[torch.Tensor]],
-        recv_tasks: Dict[int, List[torch.Tensor]],
-        max_inflight_bytes: int | None,
-    ) -> int | None:
-        """Steps per flush, identical on every rank so a pair flushes together.
-
-        None => one batch for the whole transfer. The per-step byte peak is
-        all-reduced (MAX) over the world group so the derived stride is global.
-        """
-        if max_inflight_bytes is None:
-            return None
-        peak_step_bytes = 0
-        for step in range(1, num_steps):
-            peer = self._comm._rank ^ step
-            if peer >= world_size:
-                continue
-            step_bytes = sum(t.nbytes for t in send_tasks.get(peer, ())) + sum(
-                t.nbytes for t in recv_tasks.get(peer, ())
+        """Copy byte range ``chunk`` of the logical slice concatenation into
+        ``stage``. A CPU (offloaded) source slice is staged to GPU by the
+        cross-device copy itself, ordered before the NCCL ops by the shared
+        default stream. NB: offloaded (HDO) optimizer state is mostly pageable
+        CPU memory, so non_blocking is effectively synchronous for it; correct,
+        just not overlapped."""
+        offset = 0
+        for idx, t_off, n in slice_spans(sizes, *chunk):
+            stage[offset : offset + n].copy_(
+                byte_views[idx][t_off : t_off + n], non_blocking=True
             )
-            peak_step_bytes = max(peak_step_bytes, step_bytes)
-        peak = torch.tensor(
-            [peak_step_bytes], device=torch.cuda.current_device(), dtype=torch.int64
-        )
-        torch.distributed.all_reduce(peak, op=torch.distributed.ReduceOp.MAX)
-        peak_step_bytes = int(peak.item())
-        if peak_step_bytes == 0:
-            return None
-        return max(1, max_inflight_bytes // peak_step_bytes)
+            offset += n
 
     @staticmethod
-    def _pack_from(tensors: List[torch.Tensor]) -> torch.Tensor:
-        """Coalesce ``tensors`` into one contiguous GPU uint8 buffer. CPU
-        sources are staged to GPU by the cross-device byte copy."""
-        total_nbytes = sum(t.nbytes for t in tensors)
-        packed = torch.empty(
-            total_nbytes, dtype=torch.uint8, device=torch.cuda.current_device()
-        )
-        # non_blocking H2D is safe: this copy and the subsequent NCCL send share
-        # the default stream, and offloaded (HDO) CPU state is pinned.
+    def _unpack_chunk(
+        byte_views: List[torch.Tensor],
+        sizes: List[int],
+        chunk: Tuple[int, int],
+        stage: torch.Tensor,
+    ) -> None:
+        """Scatter received ``stage`` bytes back into the destination slices.
+        CPU destinations are staged out by the copy (blocking, as before —
+        the host reads offloaded state right after transfer)."""
         offset = 0
-        for tensor in tensors:
-            tensor_bytes = tensor.contiguous().view(torch.uint8).reshape(-1)
-            nbytes = tensor_bytes.numel()
-            packed[offset : offset + nbytes].copy_(tensor_bytes, non_blocking=True)
-            offset += nbytes
-        return packed
-
-    @staticmethod
-    def _alloc_packed(tensors: List[torch.Tensor]) -> torch.Tensor:
-        total_nbytes = sum(t.nbytes for t in tensors)
-        return torch.empty(
-            total_nbytes, dtype=torch.uint8, device=torch.cuda.current_device()
-        )
-
-    @staticmethod
-    def _unpack_into(packed: torch.Tensor, tensors: List[torch.Tensor]) -> None:
-        """Scatter a received packed buffer back into the (contiguous)
-        destination tensors. CPU destinations are staged out by the copy."""
-        offset = 0
-        for tensor in tensors:
-            tensor_bytes = tensor.view(torch.uint8).reshape(-1)
-            nbytes = tensor_bytes.numel()
-            tensor_bytes.copy_(packed[offset : offset + nbytes])
-            offset += nbytes
+        for idx, t_off, n in slice_spans(sizes, *chunk):
+            byte_views[idx][t_off : t_off + n].copy_(stage[offset : offset + n])
+            offset += n

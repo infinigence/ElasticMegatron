@@ -95,9 +95,9 @@ complexity, and a badly-sized bucket could be slower or OOM.
 
 ## Code anchors
 
-- Packing / staging / butterfly / bucketing:
-  `transfer/communicator.py::BatchedTransfer.transfer` / `_enqueue_peer` / `_pack_from` /
-  `_unpack_into` / `_flush_stride`.
+- Packing / staging / butterfly / byte-chunking:
+  `transfer/communicator.py::BatchedTransfer.transfer` / `_enqueue_unpacked` / `_pack_chunk` /
+  `_unpack_chunk` and `transfer/chunk_schedule.py::chunk_ranges` / `slice_spans`.
 - Per-tensor staging (no-pack path): `transfer/communicator.py::BatchP2P.isend/irecv`.
 - Same staging idea per-tensor: [`../hybrid_adam/README.md`](../hybrid_adam/README.md) F2,
   [`../project/optimizer_state_model.md`](../project/optimizer_state_model.md).

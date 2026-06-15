@@ -116,15 +116,15 @@ unreachable dead code and was not added. Both ranks of a pair meet at the same s
 lower rank enqueues sends first, the higher enqueues recvs first — within one
 `batch_isend_irecv` group there is no deadlock.
 
-### 3.5 Optional memory-aware bucketing
+### 3.5 Memory-aware byte chunking
 
-`max_inflight_bytes` (env `ELASTIC_MAX_INFLIGHT_BYTES`) caps the bytes in flight per
-`batch_isend_irecv`, bounding the GPU staging footprint of packing. Cross-rank flush
-points **must be step-aligned**, otherwise paired ranks desync and deadlock — so the
-stride is a **fixed number of steps**, not a per-rank byte threshold: `_flush_stride`
-all-reduces (MAX) the per-step byte peak so every rank derives the **same**
-`flush_every_n_steps`. Default unset = one batch (no extra collective, behaviour
-unchanged). The env must be identical on every rank.
+The packed path caps the bytes staged per `batch_isend_irecv` round, so staging residency
+is bounded by ~2x the cap regardless of model size. Each peer's ordered slice list is split
+into byte chunks (`chunk_schedule.chunk_ranges` / `slice_spans`) and exchanged in rounds
+reusing one send + one recv uint8 staging buffer. Both ends of a pair derive identical chunk
+boundaries from the same `(slice sizes, cap)`, so this needs **no collective exchange**. The
+cap is resolved per reshard by `ELASTIC_STAGING_CAP_MODE` (see §3.7) and is identical on
+every rank.
 
 ### 3.6 Deleted / kept
 
@@ -136,16 +136,17 @@ unchanged). The env must be identical on every rank.
 - **Kept**: `_resolve_transfer_layout`, `_should_skip_virtual_param`, all
   `OptimizerTensorInfo` lifecycle calls.
 
-Local static checks: all changed files `py_compile`; no dangling references; adversarial
-review (`code-polish` step 4) returned **SHIP-WITH-NITS** with no HIGH findings (one MED +
-a few LOW, all comment/doc, fixed).
+The byte-chunking layer (§3.5) later replaced the step-aligned `_flush_stride` flush (and
+its all-reduce) with per-peer byte chunks: `_pack_from`/`_unpack_into`/`_enqueue_peer` gave
+way to `_pack_chunk`/`_unpack_chunk`/`_enqueue_unpacked` + `chunk_schedule`.
 
 ### 3.7 Environment variables
 
 | Var | Default | Effect |
 |---|---|---|
-| `ELASTIC_USE_ASYNCBUFFER_P2P` | `0` | `1` = packed fast path (one buffer + one `batch_isend_irecv` per peer); `0` = one staged p2p op per slice. |
-| `ELASTIC_MAX_INFLIGHT_BYTES` | unset | Cap bytes in flight per flush (bounds the GPU staging footprint). Unset = single batch. **Must be identical on every rank** (it drives a step-aligned flush stride). |
+| `ELASTIC_USE_ASYNCBUFFER_P2P` | `1` | `1` = packed fast path (per-peer slices coalesced into reused staging buffers, byte-chunked); `0` = one staged p2p op per slice (legacy fallback; `ELASTIC_MAX_INFLIGHT_BYTES` ignored). |
+| `ELASTIC_STAGING_CAP_MODE` | `free` | Per-chunk staging cap source: `free` = clamp(min current free GPU mem across union ranks // 2, 1 GiB, 8 GiB) via one MIN all-reduce (reflects real device memory, incl. co-tenant processes); `fixed` = 2 GiB constant. |
+| `ELASTIC_MAX_INFLIGHT_BYTES` | unset | Overrides the mode: positive = exact per-chunk cap; `<=0` = one chunk per peer (legacy residency). **Must be identical on every rank** (both ends derive chunk counts from it). |
 | `ELASTIC_TRANSFER_LOG_LEVEL` | `1` | `0` disables per-phase transfer timing (zero overhead); otherwise rank 0 prints per-phase ms. |
 
 ## 4. Verification
