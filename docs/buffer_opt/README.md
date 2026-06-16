@@ -145,7 +145,7 @@ way to `_pack_chunk`/`_unpack_chunk`/`_enqueue_unpacked` + `chunk_schedule`.
 | Var | Default | Effect |
 |---|---|---|
 | `ELASTIC_USE_ASYNCBUFFER_P2P` | `1` | `1` = packed fast path (per-peer slices coalesced into reused staging buffers, byte-chunked); `0` = one staged p2p op per slice (legacy fallback; `ELASTIC_MAX_INFLIGHT_BYTES` ignored). |
-| `ELASTIC_STAGING_CAP_MODE` | `free` | Per-chunk staging cap source: `free` = clamp(min current free GPU mem across union ranks // 2, 1 GiB, 8 GiB) via one MIN all-reduce (reflects real device memory, incl. co-tenant processes); `fixed` = 2 GiB constant. |
+| `ELASTIC_STAGING_CAP_MODE` | `free` | Per-chunk staging cap source: `free` = clamp((min current free GPU mem across union ranks − 2 GiB reserve) // 2, 512 MiB, 8 GiB) via one MIN all-reduce (the 2 GiB reserve keeps 2× cap from filling the card; reflects real device memory, incl. co-tenant processes); `fixed` = 2 GiB constant. |
 | `ELASTIC_MAX_INFLIGHT_BYTES` | unset | Overrides the mode: positive = exact per-chunk cap; `<=0` = one chunk per peer (legacy residency). **Must be identical on every rank** (both ends derive chunk counts from it). |
 | `ELASTIC_TRANSFER_LOG_LEVEL` | `1` | `0` disables per-phase transfer timing (zero overhead); otherwise rank 0 prints per-phase ms. |
 
@@ -190,10 +190,11 @@ python3 tools/ckpt/verify_all.py --thresh 1e-3      # expect 8/8 weight + 8/8 op
 - **Overlap H2D/D2H with NCCL** for CPU-adam — design captured (not implemented) in
   [`cpu-adam-overlap.md`](cpu-adam-overlap.md); first step is to time pack/NCCL/unpack
   separately inside `BatchedTransfer.transfer` and measure whether PCIe staging dominates.
-- **Auto-size bucketing** — `ELASTIC_MAX_INFLIGHT_BYTES` is currently manual and must match
-  across ranks. Could derive it from `torch.cuda.mem_get_info()` (whole-GPU free, sees
-  other processes — right for RL co-location) ∩ this process's
-  `memory_reserved() - memory_allocated()`, then `all_reduce(MIN)` for a global budget.
+- **Auto-size bucketing** — done as `ELASTIC_STAGING_CAP_MODE=free` (default): cap =
+  `clamp((torch.cuda.mem_get_info() whole-GPU free across union ranks − 2 GiB reserve) / 2,
+  512 MiB, 8 GiB)` via one `all_reduce(MIN)` (whole-GPU free sees co-tenant processes —
+  right for RL co-location). Possible refinement: also intersect with this process's
+  `memory_reserved() - memory_allocated()` headroom.
 - **Perf profiling** — pack vs no-pack benefit at different message sizes.
 - **`log_communication_info`** does an unconditional `all_gather_object` + table print per
   reshard; gate it behind a verbosity flag (LOW).

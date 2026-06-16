@@ -39,21 +39,27 @@ def slice_spans(
     return spans
 
 
-STAGING_CAP_FLOOR = 1 << 30  # 1 GiB
+STAGING_CAP_FLOOR = 512 << 20  # 512 MiB
 STAGING_CAP_CEIL = 8 << 30  # 8 GiB
 STAGING_CAP_DEFAULT = 2 << 30  # 2 GiB (fixed-mode cap)
+STAGING_CAP_RESERVE = 2 << 30  # 2 GiB held back so 2x cap never fills the card
 
 
 def derive_staging_cap(
     available_bytes: int | None,
     floor: int = STAGING_CAP_FLOOR,
     ceil: int = STAGING_CAP_CEIL,
+    reserve: int = STAGING_CAP_RESERVE,
 ) -> int:
-    """Staging-chunk cap = ``available_bytes`` // 2, clamped to [floor, ceil].
+    """Staging-chunk cap = ``(available_bytes - reserve)`` // 2, clamped to [floor, ceil].
 
-    Halved because the send and recv staging buffers coexist. ``available_bytes``
-    is the memory known free for staging (free mode: the smallest current free
-    GPU memory across the union ranks). None/<=0 falls back to the floor."""
+    ``reserve`` bytes are held back FIRST, then the remainder is halved because the
+    send and recv staging buffers coexist -- so 2x cap never consumes all of
+    ``available_bytes`` and leaves headroom for the dst rebuild and other transient
+    reshard-window allocations (without it 2x cap == available exactly, inviting OOM).
+    ``available_bytes`` is the memory known free for staging (free mode: the smallest
+    current free GPU memory across the union ranks). None/<=0, or available at/below
+    the reserve, falls back to the floor."""
     if not available_bytes or available_bytes <= 0:
         return floor
-    return min(ceil, max(floor, available_bytes // 2))
+    return min(ceil, max(floor, (available_bytes - reserve) // 2))

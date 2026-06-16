@@ -337,16 +337,27 @@ class BatchedTransfer:
         num_steps = 1 << ((world_size - 1).bit_length())
 
         if not pack:
-            batch = comm.batch_p2p()
+            # One batch_isend_irecv per butterfly STEP (peer pair), not a single
+            # batch over all peers. This path emits one p2p op per slice, and
+            # coalescing every peer's slices into a single batch_isend_irecv
+            # deadlocks when the reshard plan gives ranks an asymmetric op set
+            # (dense multi-strategy reshards): the ranks diverge on the NCCL
+            # collective sequence (a per-rank SeqNum split, caught at the wait).
+            # One batch per paired step keeps each coalesced group to a single
+            # symmetric peer pair — the structure the packed path below uses.
+            # The cap is ignored on this path (legacy per-slice residency).
             for step in range(1, num_steps):
                 peer = comm._rank ^ step
                 if peer >= world_size:
                     continue
-                self._enqueue_unpacked(
-                    batch, peer, send_tasks.get(peer), recv_tasks.get(peer)
-                )
-            with self._phase("comm"):
-                batch.wait()
+                peer_sends = send_tasks.get(peer)
+                peer_recvs = recv_tasks.get(peer)
+                if not peer_sends and not peer_recvs:
+                    continue
+                batch = comm.batch_p2p()
+                self._enqueue_unpacked(batch, peer, peer_sends, peer_recvs)
+                with self._phase("comm"):
+                    batch.wait()
             return
 
         # Reused staging buffers, sized lazily to the largest chunk seen and

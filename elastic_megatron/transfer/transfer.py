@@ -44,9 +44,10 @@ class TransferManager:
         # Byte cap per staging chunk in the packed path; staging residency is
         # bounded by ~2x this value. Resolved per reshard in _resolve_staging_cap
         # right before the exchange. ELASTIC_STAGING_CAP_MODE selects the source:
-        #   free (default): smallest current free GPU memory across the union
-        #     ranks / 2, clamped to [1 GiB, 8 GiB] — the only mode that reflects
-        #     real device memory, including co-tenant processes on the card.
+        #   free (default): (smallest current free GPU memory across the union
+        #     ranks − a 2 GiB reserve) / 2, clamped to [512 MiB, 8 GiB] — the
+        #     reserve keeps 2x cap from filling the card; the only mode that
+        #     reflects real device memory, including co-tenant processes.
         #   fixed: a 2 GiB constant.
         # ELASTIC_MAX_INFLIGHT_BYTES, when set, overrides the mode: a positive
         # value is the exact cap; <=0 disables chunking (one chunk per peer,
@@ -64,10 +65,10 @@ class TransferManager:
 
         ELASTIC_MAX_INFLIGHT_BYTES, when set, wins (positive = exact cap; <=0 =
         one chunk per peer). Otherwise ELASTIC_STAGING_CAP_MODE picks the source:
-        ``fixed`` => a 2 GiB constant; ``free`` (default) => the smallest current
+        ``fixed`` => a 2 GiB constant; ``free`` (default) => (the smallest current
         free GPU memory across the union ranks (one MIN all-reduce; the no-group
-        collective lands on the union via the dist patch) / 2, clamped to
-        [1 GiB, 8 GiB]. Called right before the exchange so the free reading
+        collective lands on the union via the dist patch) − a 2 GiB reserve) / 2,
+        clamped to [512 MiB, 8 GiB]. Called right before the exchange so the free reading
         reflects the post-release_model state of the card.
         """
         if self._explicit_inflight is not None:

@@ -81,21 +81,27 @@ def test_schedule_symmetry():
 
 def test_derive_staging_cap():
     GiB = 1 << 30
-    # 无可用量信息 / hygiene 关 → 下限
-    assert derive_staging_cap(None) == GiB
-    assert derive_staging_cap(0) == GiB
-    # 推导值低于下限 → 钳到 1 GiB
-    assert derive_staging_cap(1 << 20) == GiB
-    assert derive_staging_cap(2 * GiB) == GiB  # A/2 恰好 = 下限
-    # 正常区间：cap = A/2（发+收两块货位共存）
-    assert derive_staging_cap(3 * GiB) == 3 * GiB // 2
-    assert derive_staging_cap(10 * GiB) == 5 * GiB
+    MiB = 1 << 20
+    FLOOR = 512 * MiB  # hard staging-cap floor
+    RESERVE = 2 * GiB  # default headroom subtracted before halving
+    # 无可用量信息 / hygiene 关 → 下限 (512 MiB)
+    assert derive_staging_cap(None) == FLOOR
+    assert derive_staging_cap(0) == FLOOR
+    # available <= reserve → usable<=0 → 钳到下限 (512 MiB)
+    assert derive_staging_cap(MiB) == FLOOR
+    assert derive_staging_cap(2 * GiB) == FLOOR  # (2-2)//2=0 → floor
+    # 正常区间：cap = (available − 2GiB 余量) / 2（发+收两块货位共存 + 留余量）
+    assert derive_staging_cap(3 * GiB) == FLOOR          # (3-2)//2 = 512MiB = floor
+    assert derive_staging_cap(5 * GiB) == 3 * GiB // 2   # 用户场景:5GB→1.5GiB,2×cap=3GiB,留2GiB
+    assert derive_staging_cap(10 * GiB) == 4 * GiB       # (10-2)//2 = 4GiB
+    # 余量保证 2×cap 不打满 available
+    assert 2 * derive_staging_cap(5 * GiB) == 5 * GiB - RESERVE
     # 超大模型 → 钳到 8 GiB 上限
-    assert derive_staging_cap(100 * GiB) == 8 * GiB
-    # 自定义钳位透传
-    assert derive_staging_cap(10, floor=10, ceil=20) == 10   # 10//2=5 → floor
-    assert derive_staging_cap(30, floor=10, ceil=20) == 15   # 区间内 A/2
-    assert derive_staging_cap(100, floor=10, ceil=20) == 20  # 100//2=50 → ceil
+    assert derive_staging_cap(100 * GiB) == 8 * GiB      # (100-2)//2=49 → ceil
+    # 自定义钳位透传（reserve=0 隔离 clamp 逻辑）
+    assert derive_staging_cap(10, floor=10, ceil=20, reserve=0) == 10   # 10//2=5 → floor
+    assert derive_staging_cap(30, floor=10, ceil=20, reserve=0) == 15   # 区间内
+    assert derive_staging_cap(100, floor=10, ceil=20, reserve=0) == 20  # 100//2=50 → ceil
 
 
 if __name__ == "__main__":
