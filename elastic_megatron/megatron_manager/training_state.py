@@ -358,6 +358,17 @@ class TrainingState:
     def release_optimizer(self):
         for optimizer_tensor_info in self.optimizer_tensor_info_list:
             optimizer_tensor_info.release()
+        # The per-param release above resize_(0)'s the param-shaped master + moments
+        # (POOL A). The CPU-offload optimizer (HybridDeviceOptimizer) also holds
+        # pinned host grad buffers (POOL B) that nothing above reaches; free them on
+        # this becoming-dormant gear so they don't accumulate N x across cached
+        # strategies. No-op for non-offload optimizers; lazily re-created on the
+        # gear's next step (see HybridDeviceOptimizerAdapter.release_offload_host_buffers).
+        # Default ON; ELASTIC_RELEASE_HDO_HOST_BUFFERS=0 reverts to the old (leaking)
+        # behaviour for A/B measurement and as a safety hatch.
+        if os.environ.get("ELASTIC_RELEASE_HDO_HOST_BUFFERS", "1") == "1":
+            for optimizer in self.optimizers:
+                OptimizerAdapter.create(optimizer).release_offload_host_buffers()
 
     def rebuild_optimizer(self):
         for optimizer_tensor_info in self.optimizer_tensor_info_list:
