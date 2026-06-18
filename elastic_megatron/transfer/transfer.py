@@ -59,6 +59,10 @@ class TransferManager:
             int(raw_inflight) if raw_inflight is not None else None
         )
         self._max_inflight_bytes: int | None = None
+        # Verification aid: log the main-process peak reserved/allocated GPU bytes
+        # (rank 0). The flat-peak fix should show a peak of ~max(src,dst)+chunk_size
+        # that does NOT scale with the number of chunks, vs the 2x-shard baseline.
+        self._peak_probe = os.getenv("ELASTIC_TRANSFER_PEAK_PROBE", "0") == "1"
 
     def _resolve_staging_cap(self) -> int | None:
         """Per-chunk staging byte cap for this reshard, identical on every rank.
@@ -733,7 +737,24 @@ class TransferManager:
                 process_fn(virtual_param)
 
         process_virtual_params(self._pre_process)
+        if self._peak_probe and not self.fake_transfer:
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
         self._main_process(virtual_param_space.all_virtual_params)
+        if self._peak_probe and not self.fake_transfer:
+            torch.cuda.synchronize()
+            if self._rank == 0:
+                cap = self._max_inflight_bytes
+                cap_s = (
+                    "no-split" if not cap or cap <= 0 else f"{cap / (1 << 20):.0f}MiB"
+                )
+                print(
+                    "[ElasticMegatron-Transfer] main-process peak: "
+                    f"reserved={torch.cuda.max_memory_reserved() / (1 << 20):.0f}MiB "
+                    f"allocated={torch.cuda.max_memory_allocated() / (1 << 20):.0f}MiB "
+                    f"(cap={cap_s})",
+                    flush=True,
+                )
         process_virtual_params(self._post_process)
         self.transfer_word_embedding_and_output_layer(
             virtual_param_space.all_virtual_params[0],
