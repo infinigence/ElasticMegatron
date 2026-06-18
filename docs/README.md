@@ -1,5 +1,23 @@
 # ElasticMegatron docs
 
+> ## 接手 prompt(下个 session 直接照做)
+>
+> **任务:实现 Task 3(flat-peak reshard transfer)—— 代码开发。**
+>
+> **在 worktree `../em-pack-peak`(分支 `fix/transfer-flat-peak`)里干活,不是主 checkout。** 按本仓 `CLAUDE.md` onboard:读本文件下方的 **"Current state / handoff (2026-06-18)"** 块 → `buffer_opt/reshard-peak-memory.md`(设计)→ `buffer_opt/reshard-flat-peak-plan.md`(**Task 3 §3a–3e 就是下一步**)。耐用结论也在跨会话 memory 里。
+>
+> **现状:** 传输峰值从 `max(src,dst)` 回归成了 `~2×shard+2×cap`;修复 = chunked **approach-2**(`pack src → 释放 src → comm → 建 dst → unpack`),峰值 `= max(src,dst)+chunk_size`。**Task 1 已完成**(`dbd6975` chunker + `233317b` accessor 修正)。**机制已定**(`8913704`:phase-split `pack/exchange/unpack`、self-copy 延迟到 unpack —— 已证 deadlock-safe)。**Task 3 = 下一步。**
+>
+> **自验进度:** `git -C ../em-pack-peak log --oneline -10`;`elastic_megatron/transfer/transfer.py` 的 `_main_process` 仍是批量-全量版(Task 3 未落);`PYTHONPATH=.:$MEGATRON_PATH python3 tests/test_transfer_chunking.py`(机器上 PASS,本机 SKIP)。
+>
+> **做 Task 3(§3a–3e):** 给 `BatchedTransfer` 加 `pack()/exchange()/unpack()`(`exchange` 里的 butterfly **原样照搬**;`transfer()` 保留给 `_pre/_post` + no-pack);`_main_process` 改成逐 chunk 循环;**recv staging 尺寸用 dst 占位符 metadata + recv ranges 算,不用已分配的 dst**(这样 create-dst 才能留在 comm 之后);**self-copy 延迟到 unpack**。护栏:padded 释放仍留 `_post_process`;`_pre/_post` 不动;保持 I-16。
+>
+> **续接纪律:** 别重跑已定的设计/死锁调查(已结晶进 docs+memory);sub-agent 重新 spawn、别复用旧 ID;每次 commit 跑 py_compile + ruff + `test_transfer_chunking.py`。**Task 3 之后:** 对抗式 review workflow → **A100 bit-exact `verify_all`**(CPU_OFFLOAD=0 GPU-adam **和** =1 cpu-adam,pack on/off)+ `ELASTIC_TRANSFER_PEAK_PROBE` 探针 —— **ckpt 走 off-NFS `/tmp`,起 GPU 前先确认 A100 空闲。**
+>
+> **别混淆:** **30B 间歇性卡死**(`feat/hostmem-30b-hang`,卡在 shrink 后的 "building GPT model")是**另一个独立未决问题**(疑似 NCCL-group/c10d 竞态;需 3–5× 反复跑 + py-spy),**不是** flat-peak 这条线。
+>
+> **推荐 skill:** `systematic-debugging`(卡死/OOM/desync)、`verification-before-completion`、`graphify`(导航)、`gpu-run`(验证)。设计已定,无需 brainstorming。
+
 Four areas:
 
 - **[`project/`](project/)** — **start here.** Project-wide knowledge that survives across sessions: architecture, code layout, invariants you cannot break, the [optimizer state model](project/optimizer_state_model.md), debugging playbook, the cross-repo relationship with `Megatron-LM-custom`. Read these before changing code.
