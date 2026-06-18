@@ -12,7 +12,7 @@
 >
 > **Task 3 已做完(§3a–3e 全落)** —— 不要重做。机制:`BatchedTransfer.pack()/exchange()/unpack()`(`exchange` butterfly 原样照搬;`transfer()` 仍服务 `_pre/_post`+no-pack);recv staging 用 metadata 定尺寸(`release()` 后 shape/dtype 还在);self-copy 复用已有队列延迟到 unpack;I-16 + padded 释放时序保持。
 >
-> **续接纪律:** 别重跑已定的设计/死锁调查(已结晶进 docs+memory);sub-agent 重新 spawn、别复用旧 ID;每次 commit 跑 py_compile + ruff + `test_transfer_chunking.py`。**唯一剩下的门 = A100 bit-exact `verify_all`**(CPU_OFFLOAD=0 GPU-adam **和** =1 cpu-adam,pack on/off)+ `ELASTIC_TRANSFER_PEAK_PROBE` 探针 —— **ckpt 走 off-NFS `/tmp`,起 GPU 前先确认 A100 空闲。**
+> **续接纪律:** 别重跑已定的设计/死锁调查(已结晶进 docs+memory);sub-agent 重新 spawn、别复用旧 ID;每次 commit 跑 py_compile + ruff + `test_transfer_chunking.py`。**唯一剩下的门 = A100 bit-exact `verify_all`**(CPU_OFFLOAD=0 GPU-adam **和** =1 cpu-adam,pack on/off)+ `ELASTIC_TRANSFER_PEAK_PROBE` 探针 —— **ckpt 走 off-NFS `/tmp`;A100 常驻空闲、有最高优先级使用权,直接用 `gpu-run` skill 起,不用先问。**
 >
 > **别混淆:** **30B 间歇性卡死**(`feat/hostmem-30b-hang`,卡在 shrink 后的 "building GPT model")是**另一个独立未决问题**(疑似 NCCL-group/c10d 竞态;需 3–5× 反复跑 + py-spy),**不是** flat-peak 这条线。
 >
@@ -80,7 +80,8 @@ branches/worktrees:
 
 **Immediate next step:** **A100 bit-exact `verify_all`** for the now-landed Task 3 on
 `fix/transfer-flat-peak` — CPU_OFFLOAD=0 (GPU-adam, the regressed path) AND =1 (cpu-adam), pack on/off,
-plus the `ELASTIC_TRANSFER_PEAK_PROBE` peak check; ckpt off-NFS `/tmp`; confirm A100 is free first.
+plus the `ELASTIC_TRANSFER_PEAK_PROBE` peak check; ckpt off-NFS `/tmp`. A100 is always free with
+top-priority access — launch directly via the `gpu-run` skill, no need to ask first.
 Task 3 itself is implemented (`8a128e5`/`286d709`/`647b693`) and adversarially reviewed (0 confirmed
 bugs; the cpu-adam pinned-src hazard the review surfaced is fixed by `647b693`). The durable findings
 (codex review verdict, the flat-peak regression + Task 3 landing, the intermittent hang) live in
