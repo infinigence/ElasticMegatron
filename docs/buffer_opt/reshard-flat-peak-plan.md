@@ -138,41 +138,69 @@ if __name__ == "__main__":
 
 ---
 
-### Task 2: [INVESTIGATION — dispatched to sub-agent `transfer-order-investigator`] resolve the within-chunk comm-ordering mechanism
+### Task 2: [RESOLVED by `transfer-order-investigator` + user] mechanism = phase-split, defer self-copy
 
-The approach-2 ordering needs `pack-src → release-src → comm → create-dst → unpack`, but the current
-`batched_transfer.transfer` does pack+comm+unpack atomically and needs dst pre-allocated (for the
-unpack views), and interleaves pack/comm/unpack per cap-round. **Open question:** the minimal,
-deadlock-safe way to let `_main_process` interleave release-src (after pack) and create-dst (before
-unpack) per chunk, preserving cap-chunking + future overlap. Candidate mechanisms: (a) callbacks
-(`on_packed=release_src`, `on_pre_unpack=create_dst`) into `transfer()`; (b) split `transfer()` into
-`pack()/exchange()/unpack()` phases; (c) generalize the baseline's separate send/recv phases.
+**Confirmed deadlock-safe:** the butterfly comm touches ONLY the staging byte-buffers, never the
+src/dst optimizer tensors (chain `src → pack → s_stage → [NCCL] → r_stage → unpack → dst`). So
+releasing src after pack and creating dst after the comm is deadlock- and bit-exact-neutral.
 
-- [ ] **Step 1:** await the sub-agent's findings (butterfly deadlock-safety, baseline send/recv
-  separation, the per-cap-round vs per-chunk reconciliation, recommended mechanism).
-- [ ] **Step 2:** decide the mechanism WITH the user, then finalize Task 3's exact code.
+**Decision (Option b):** split `BatchedTransfer.transfer` into `pack()` / `exchange()` / `unpack()`
+phases the manager drives per chunk. `exchange()` keeps the butterfly (`peer = rank ^ step`,
+send-first/recv-first by `rank < peer`, per-pair `batch_isend_irecv`) **verbatim** — the
+deadlock-critical machinery is untouched. `transfer()` is KEPT for `_pre_process` / `_post_process`
+(DP gather/scatter) and the no-pack legacy; only `_main_process` moves to the phases.
 
----
+**Decision (self-copy):** survival-rank self-edges currently go through the self-copy queue at
+collect time and `_recv_self` reads immediately — which needs dst before the comm. **Defer them to
+the unpack phase:** stash each self-edge's src bytes during pack; apply them to dst during unpack
+(after dst is created). So self-copies obey the same src-released-before-dst-created ordering.
 
-### Task 3: [PENDING Task 2] chunked approach-2 `_main_process`
+### Task 3: chunked approach-2 `_main_process` (the fix)
 
-Sketch (exact code after Task 2 picks the mechanism):
+**3a. recv-size-from-metadata helper.** To keep create-dst AFTER the comm, `exchange` must size the
+recv staging WITHOUT the dst tensors. Add a helper that sums per-peer recv bytes from the chunk's
+`reshard_plan.global_recv_info[rank]` ranges × the dst placeholder's `Σ(state element_size)` (the
+dst `OptimizerTensorInfo` exists as storage-0 placeholders from dst setup — shape/dtype intact). No
+allocation. Self-edge (`src == rank`) recv bytes are excluded from the NCCL recv size (handled by
+the deferred self-copy).
 
+**3b. phase methods on `BatchedTransfer`** (new; `transfer()` unchanged):
+- `pack(send_tasks) -> {peer: send_staging}`: contiguous uint8 GPU buffer per peer from the src
+  byte-views; reuse instance buffers across chunks. After `pack` the caller may release src.
+- `exchange({peer: send_staging}, {peer: recv_nbytes}) -> {peer: recv_staging}`: the butterfly
+  (verbatim ordering); allocate a recv staging per peer sized by `recv_nbytes`; one
+  `batch_isend_irecv` per pair. Touches only staging.
+- `unpack({peer: recv_staging}, recv_tasks) -> None`: scatter recv staging into the dst byte-views
+  (dst now created), then apply the deferred self-copies.
+
+**3c. `_main_process` per-chunk loop:**
 ```python
     def _main_process(self, virtual_params):
         budget_numel = (max(1, self._max_inflight_bytes // self._resolve_state_bytes_per_numel(virtual_params))
                         if self._max_inflight_bytes and self._max_inflight_bytes > 0 else None)
         for chunk in self._chunk_virtual_params(virtual_params, budget_numel):
-            # approach 2 (mechanism per Task 2):
-            #   pack chunk src -> send staging ; RELEASE chunk src
-            #   exchange (butterfly, cap-chunked staging within)
-            #   CREATE chunk dst (create_padded + rebuild) ; unpack recv staging -> dst
-            ...
+            send_tasks, self_src = self._collect_chunk_sends(chunk)        # src views + stashed self-edge src
+            recv_nbytes = self._chunk_recv_nbytes(chunk)                   # 3a, from metadata (no dst alloc)
+            staged = self.batched_transfer.pack(send_tasks)
+            self._release_chunk_src(chunk)                                 # ← before exchange
+            received = self.batched_transfer.exchange(staged, recv_nbytes)
+            self._create_chunk_dst(chunk)                                  # create_padded + rebuild ← after exchange
+            recv_tasks, recv_copy_back = self._collect_chunk_recvs(chunk)  # dst views (dst now exists)
+            self.batched_transfer.unpack(received, recv_tasks)
+            for recv_slice, buf in recv_copy_back: recv_slice.data.copy_(buf)
+            self._apply_self_copies(self_src, chunk)                       # deferred self-edges → dst
+            self._release_chunk_src_padded(chunk)
 ```
+Reuses the existing `_collect_send`/`_collect_recv` slice logic (refactored to per-chunk + self-edge
+stashing). `chunk = cap` for the first landing (one staging group); the chunk-size knob + multi-cap
+overlap is a later seam (do NOT hardcode chunk = 2×cap).
 
-- chunk_size knob: default = the staging cap-group; leave an interface for multi-cap-group overlap
-  (do NOT hardcode chunk = 2×cap). bit-exact preserved (same bytes/order; only release/create timing
-  + batch boundary move). Subsumes codex's cpu-adam-only `_main_process_streaming`.
+**3d. residual-risk guards** (from the investigation): keep padded-buffer release in `_post_process`
+(don't release early); leave `_pre_process`/`_post_process` on `transfer()` (verify their self-copy
++ create_padded ordering is unchanged); preserve the I-16 same-stream reclaim.
+
+**3e. bit-exact** preserved (same bytes/order; only release/create timing + batch boundary move).
+Subsumes codex's cpu-adam-only `_main_process_streaming`.
 
 ---
 
