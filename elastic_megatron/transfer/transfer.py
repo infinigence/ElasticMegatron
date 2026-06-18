@@ -492,6 +492,21 @@ class TransferManager:
         # now staged) BEFORE the comm: this is what keeps src and dst from
         # coexisting (approach 2). The self-edge clones already hold their bytes.
         staged = self.batched_transfer.pack(send_tasks)
+        # pack's stage-in of a HOST-resident (CPU-offloaded) src is an H2D copy
+        # that is async w.r.t. the host when the src is pinned; release() below
+        # frees that host storage on the host thread, so without a barrier it can
+        # race the still-in-flight copy and tear the bytes. The pre-chunking path
+        # released only AFTER the NCCL wait() (an implicit host sync); restore
+        # that guarantee here -- explicitly, NOT via the profiling-only _phase()
+        # synchronize (which disappears at ELASTIC_TRANSFER_LOG_LEVEL=0). A
+        # GPU-resident src needs no barrier: its copy and the later same-stream
+        # reuse are stream-ordered (I-16), so the GPU-adam path pays nothing.
+        if any(
+            tensor.device.type != "cuda"
+            for src_info in src_to_release
+            for tensor in src_info.optimizer_tensors
+        ):
+            torch.cuda.current_stream().synchronize()
         for src_info in src_to_release:
             src_info.release()
 
