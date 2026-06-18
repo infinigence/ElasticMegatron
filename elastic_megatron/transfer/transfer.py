@@ -334,10 +334,12 @@ class TransferManager:
 
     @staticmethod
     def _virtual_param_global_numel(virtual_param: VirtualParam) -> int:
-        """Rank-invariant global element count of a vparam (its ``size`` property).
-        Used ONLY to cut chunk boundaries identically on every rank — it must not
-        depend on per-rank ownership, or the per-peer butterfly p2p desyncs."""
-        return virtual_param.size
+        """Rank-invariant global element count of a vparam — ``VirtualParam.numel()``
+        (= ``self.data.nelement()``; see virtual_param.py). ``data`` is always set in
+        ``VirtualParam.__init__``, so this never raises. Used ONLY to cut chunk
+        boundaries identically on every rank — it must not depend on per-rank
+        ownership, or the per-peer butterfly p2p desyncs."""
+        return virtual_param.numel()
 
     def _resolve_state_bytes_per_numel(
         self, virtual_params: List[VirtualParam]

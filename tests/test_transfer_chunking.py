@@ -17,8 +17,14 @@ def _load():
 
 
 class _VP:
-    def __init__(self, size):
-        self.size = size
+    """Stub VirtualParam: the chunker reads its global size via .numel() (matching
+    the real VirtualParam.numel() = data.nelement())."""
+
+    def __init__(self, n):
+        self._n = n
+
+    def numel(self):
+        return self._n
 
 
 def test_chunking_deterministic_budget_bounded_and_degenerate():
@@ -30,23 +36,23 @@ def test_chunking_deterministic_budget_bounded_and_degenerate():
     vps = [_VP(100), _VP(100), _VP(100), _VP(50)]
 
     chunks = list(tm._chunk_virtual_params(vps, budget_numel=200))
-    assert [[v.size for v in c] for c in chunks] == [[100, 100], [100, 50]]
+    assert [[v.numel() for v in c] for c in chunks] == [[100, 100], [100, 50]]
     # deterministic: identical inputs -> identical boundaries (rank-invariance proxy)
-    assert [[v.size for v in c] for c in tm._chunk_virtual_params(vps, 200)] == [
+    assert [[v.numel() for v in c] for c in tm._chunk_virtual_params(vps, 200)] == [
         [100, 100],
         [100, 50],
     ]
     # an oversized single vparam still goes alone (never split, never dropped)
     big = [_VP(10_000), _VP(10)]
-    assert [[v.size for v in c] for c in tm._chunk_virtual_params(big, 200)] == [
+    assert [[v.numel() for v in c] for c in tm._chunk_virtual_params(big, 200)] == [
         [10_000],
         [10],
     ]
     # degenerate: None / <=0 budget -> exactly one chunk (today's batched behaviour)
-    assert [[v.size for v in c] for c in tm._chunk_virtual_params(vps, None)] == [
+    assert [[v.numel() for v in c] for c in tm._chunk_virtual_params(vps, None)] == [
         [100, 100, 100, 50]
     ]
-    assert [[v.size for v in c] for c in tm._chunk_virtual_params(vps, 0)] == [
+    assert [[v.numel() for v in c] for c in tm._chunk_virtual_params(vps, 0)] == [
         [100, 100, 100, 50]
     ]
 
