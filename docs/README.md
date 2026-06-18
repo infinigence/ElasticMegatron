@@ -5,7 +5,7 @@ Four areas:
 - **[`project/`](project/)** — **start here.** Project-wide knowledge that survives across sessions: architecture, code layout, invariants you cannot break, the [optimizer state model](project/optimizer_state_model.md), debugging playbook, the cross-repo relationship with `Megatron-LM-custom`. Read these before changing code.
 - **[`megatron_016_adaptation/`](megatron_016_adaptation/)** — record of the May 2026 session that adapted ElasticMegatron to Megatron-LM 0.16 (commit `593ec68`). Phase-by-phase changelog, the Phase B reviewer report, the external code review and our response. Useful as a worked example of how a non-trivial adaptation lands, but **not** required reading to start working on the project.
 - **[`hybrid_adam/`](hybrid_adam/)** — ongoing work (branch `feat/hybrid-adam`) adding CPU+GPU mixed-offload optimizer support: the optimizer-state-model generalization (F1), device-aware transport (F2), and the hybrid integration (H). Read its `README.md` if you are extending optimizer support.
-- **[`buffer_opt/`](buffer_opt/)** — batched / packed reshard transport (branch `ref/buffer-opt-integration`, PR #6): coalesce each peer's optimizer-state slices into one buffer + a single `batch_isend_irecv`, behind the `communicator.transfer()` boundary, with CPU-adam staging and optional memory bucketing. Read its `README.md` if you are touching `transfer/`. Current follow-ups: [`reshard-peak-memory.md`](buffer_opt/reshard-peak-memory.md) (the flat-peak regression + fix design), [`reshard-flat-peak-plan.md`](buffer_opt/reshard-flat-peak-plan.md) (impl plan), [`cpu-adam-host-memory.md`](buffer_opt/cpu-adam-host-memory.md), [`cpu-adam-overlap.md`](buffer_opt/cpu-adam-overlap.md).
+- **[`buffer_opt/`](buffer_opt/)** — batched / packed reshard transport (branch `ref/buffer-opt-integration`, PR #6): coalesce each peer's optimizer-state slices into one buffer + a single `batch_isend_irecv`, behind the `communicator.transfer()` boundary, with CPU-adam staging and optional memory bucketing. Read its `README.md` if you are touching `transfer/`. Current follow-ups in **this worktree**: [`reshard-peak-memory.md`](buffer_opt/reshard-peak-memory.md) (the flat-peak regression + fix design), [`reshard-flat-peak-plan.md`](buffer_opt/reshard-flat-peak-plan.md) (impl plan), [`cpu-adam-overlap.md`](buffer_opt/cpu-adam-overlap.md). (The cpu-adam host-memory analysis `cpu-adam-host-memory.md` and the post-measurement overlap update live on branch `feat/cpu-adam-transfer-opt`, **not** in this worktree.)
 
 ## Current state / handoff (2026-06-18) — flat-peak transfer fix in progress (3 branches)
 
@@ -46,11 +46,17 @@ branches/worktrees:
    py-spy). The flat-peak fix (strand 1) will **subsume codex's cpu-adam-only
    `_main_process_streaming`**.
 
-3. **`feat/cpu-adam-transfer-opt`** (the repo's current checkout) — earlier cpu-adam host-memory +
-   transport-overlap work; see [`buffer_opt/cpu-adam-host-memory.md`](buffer_opt/cpu-adam-host-memory.md)
-   and [`buffer_opt/cpu-adam-overlap.md`](buffer_opt/cpu-adam-overlap.md) (single-sided overlap =
-   +14.3% on 30B, D2H-bound, default OFF). Holds entangled uncommitted docs; reconcile after the
-   flat-peak fix lands.
+3. **`feat/cpu-adam-transfer-opt`** (the repo's main checkout, `../ElasticMegatron`) — earlier
+   cpu-adam host-memory + transport-overlap work. Its design notes (`cpu-adam-host-memory.md` and
+   the post-measurement `cpu-adam-overlap.md` with the single-sided-overlap A/B = **+14.3% on 30B**,
+   D2H-bound, default OFF — from the `b2f423f` profiler run) live **on that branch**, NOT in this
+   worktree (the `cpu-adam-overlap.md` here is the older, pre-measurement version). Holds entangled
+   uncommitted docs; reconcile after the flat-peak fix lands.
+
+> Worktree map (`git worktree list`): `../em-pack-peak` = `fix/transfer-flat-peak` (active),
+> `../em-hostmem-30b` = `feat/hostmem-30b-hang`, `../ElasticMegatron` = `feat/cpu-adam-transfer-opt`.
+> A 4th worktree `../em-buffer-opt` (`fix/transfer-staging-residency`) is a **separate / parked**
+> staging-residency experiment — **not part of this flat-peak work**.
 
 **Immediate next step:** implement **Task 3** of `reshard-flat-peak-plan.md` on `fix/transfer-flat-peak`,
 then adversarial-review workflow, then A100 bit-exact verify. The durable findings (codex review

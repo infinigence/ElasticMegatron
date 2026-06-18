@@ -31,7 +31,7 @@ larger chunk → fewer/larger comms (more coalescing) at higher staging cost.
 
 ## Critical correctness constraint
 Chunk boundaries MUST be identical on every rank, or the per-peer butterfly p2p desyncs. Cut by the
-**rank-invariant `virtual_param.size`** (global numel; mirrors virtual_param.py:40-42), not per-rank
+**rank-invariant `virtual_param.numel()`** (global numel = `data.nelement()`, virtual_param.py:134-135), not per-rank
 ownership. Budget is rank-identical (derived from the rank-identical staging cap + an all-reduced
 per-numel byte size). Task 1's unit test locks the determinism in.
 
@@ -45,7 +45,12 @@ per-numel byte size). Task 1's unit test locks the determinism in.
 
 ---
 
-### Task 1: rank-invariant chunker + derived per-numel size (READY — independent of the comm mechanism)
+### Task 1: rank-invariant chunker + derived per-numel size (DONE — independent of the comm mechanism)
+
+> **DONE** — committed `dbd6975` (chunker + derived per-numel) + `233317b` (accessor fix). The
+> rank-invariant accessor is **`virtual_param.numel()`** (= `data.nelement()`, virtual_param.py:134-135),
+> **NOT `.size`** (which does not exist on `VirtualParam`; the pre-clear doc-check caught it). The
+> `.size` in the snippets below predates that fix — the committed `transfer.py` + `tests/test_transfer_chunking.py` are authoritative.
 
 **Files:** Modify `transfer.py` (3 methods on `TransferManager`); Test `tests/test_transfer_chunking.py`.
 
