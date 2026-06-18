@@ -6,7 +6,7 @@
 >
 > **在 worktree `../em-pack-peak`(分支 `fix/transfer-flat-peak`)里干活,不是主 checkout。** 按本仓 `CLAUDE.md` onboard:读本文件下方的 **"Current state / handoff (2026-06-18)"** 块 → `buffer_opt/reshard-peak-memory.md`(设计)→ `buffer_opt/reshard-flat-peak-plan.md`(**Task 3 §3a–3e 就是下一步**)。耐用结论也在跨会话 memory 里。
 >
-> **现状(2026-06-18 更新):Task 3 已实现 + 已对抗式 review;下一步 = A100 bit-exact 验证(唯一未做的门)。** 传输峰值从 `max(src,dst)` 回归成 `~2×shard+2×cap`;修复 = chunked **approach-2**(`pack src → 释放 src → comm → 建 dst → unpack`),峰值 `= max(src,dst)+chunk_size`。Task 1(`dbd6975`+`233317b`)、机制(`8913704`)早已定。**已落代码:** `8a128e5`(chunked approach-2 `_main_process` + `BatchedTransfer.pack/exchange/unpack` + `_chunk_recv_nbytes` 从 dst 占位符 metadata 定尺寸 + fake 模式单独 `_build_main_process_connections` 保原连接顺序)、`286d709`(`ELASTIC_TRANSFER_PEAK_PROBE` 探针)、`647b693`(review 发现的修复:approach-2 在 comm 前 `release()` src,**pinned host(cpu-offload)src** 的异步 H2D pack copy 会和 host 端 free 竞态撕字节 → 加显式 `current_stream().synchronize()`,只在有 host src 时,GPU-adam 不付代价)。
+> **现状(2026-06-19 更新):Task 3 已实现 + 对抗式 review + A100 bit-exact 验证全过 —— flat-peak 修复 DONE。** 传输峰值从 `max(src,dst)` 回归成 `~2×shard+2×cap`;修复 = chunked **approach-2**(`pack src → 释放 src → comm → 建 dst → unpack`),峰值 `= max(src,dst)+chunk_size`。**已落代码:** `8a128e5`(chunked approach-2 `_main_process` + `BatchedTransfer.pack/exchange/unpack` + `_chunk_recv_nbytes` 从 dst 占位符 metadata 定尺寸 + fake 模式单独 `_build_main_process_connections` 保原连接顺序)、`286d709`(`ELASTIC_TRANSFER_PEAK_PROBE` 探针)、`647b693`(review 发现:approach-2 在 comm 前 `release()` src,**pinned host(cpu-offload)src** 的异步 H2D pack copy 会和 host 端 free 竞态撕字节 → 加显式 `current_stream().synchronize()`,只在有 host src 时,GPU-adam 不付代价)。**A100 验证(2026-06-19):** dense_mix_full / 8-GPU / tiny-8层 / 9 iter,4 格(CPU_OFFLOAD=0 GPU-adam **和** =1 cpu-adam × pack on/off)全部 **`8/8 weight + 8/8 optim → ALL PASS`**,主进程峰值平在 428–516 MiB(cap 8192),无 OOM。**⚠️ 验证陷阱:** `ELASTIC_SAVE_CKPT=1` 的 bit-equal dump 写到 run dir 下的 `tools/ckpt/{before,after}_reshard`,该盘在机器上是 100% 满的共享 mount;`EXPERIMENTS_DIR=/tmp` **只**改弹性 manager 自己的 save、不改这个 dump → 必须**额外**把 `tools/ckpt` 软链到 `/tmp`,否则会在 iter≈5 假崩(torch DCP `unexpected pos` 短写,看着像代码 bug 其实是磁盘满)。
 >
 > **自验进度:** `git -C ../em-pack-peak log --oneline -6`;`_main_process` 现在是 dispatcher(fake → 连接预建分支;real → 逐 chunk approach-2);`PYTHONPATH=.:$MEGATRON_PATH python3 tests/test_transfer_chunking.py`(机器上 PASS,本机 SKIP)。
 >
@@ -78,14 +78,15 @@ branches/worktrees:
 > A 4th worktree `../em-buffer-opt` (`fix/transfer-staging-residency`) is a **separate / parked**
 > staging-residency experiment — **not part of this flat-peak work**.
 
-**Immediate next step:** **A100 bit-exact `verify_all`** for the now-landed Task 3 on
-`fix/transfer-flat-peak` — CPU_OFFLOAD=0 (GPU-adam, the regressed path) AND =1 (cpu-adam), pack on/off,
-plus the `ELASTIC_TRANSFER_PEAK_PROBE` peak check; ckpt off-NFS `/tmp`. A100 is always free with
-top-priority access — launch directly via the `gpu-run` skill, no need to ask first.
-Task 3 itself is implemented (`8a128e5`/`286d709`/`647b693`) and adversarially reviewed (0 confirmed
-bugs; the cpu-adam pinned-src hazard the review surfaced is fixed by `647b693`). The durable findings
-(codex review verdict, the flat-peak regression + Task 3 landing, the intermittent hang) live in
-cross-session memory.
+**Immediate next step: the flat-peak fix is DONE** — implemented (`8a128e5`/`286d709`/`647b693`),
+adversarially reviewed (0 confirmed bugs; the cpu-adam pinned-src hazard the review surfaced is fixed
+by `647b693`), and **A100 bit-exact verified** (2026-06-19: 8/8 weight + 8/8 optim ALL PASS across
+CPU_OFFLOAD=0 GPU-adam AND =1 cpu-adam × pack on/off, flat peak 428–516 MiB vs 8192 MiB cap, no OOM).
+Remaining follow-ups (none blocking the fix): (1) open a PR for `fix/transfer-flat-peak`; (2) fold
+codex's cpu-adam-only `_main_process_streaming` (`feat/hostmem-30b-hang`) onto this unified chunked
+path — the flat-peak path subsumes it; (3) reconcile the 3-branch entanglement
+(`feat/cpu-adam-transfer-opt` holds uncommitted docs). The durable findings (codex review verdict, the
+flat-peak regression + Task 3 landing + verify, the intermittent 30B hang) live in cross-session memory.
 
 ## If you are a new agent picking up this repo
 
