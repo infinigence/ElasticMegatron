@@ -393,95 +393,226 @@ class TransferManager:
             yield chunk
 
     def _main_process(self, virtual_params: List[VirtualParam]):
-        """Execute the cross-rank transfer plan for every param.
+        """Execute the cross-rank transfer plan for every param at a FLAT memory
+        peak (``max(src_all, dst_all) + chunk_size``).
 
-        Collect every send/recv slice into per-peer task dicts, hand them to the
-        communicator in one batched transfer, then scatter non-contiguous
-        receives and release sent storage. Self-rank slices (survival node that
-        is both sender and receiver) are copied during collection, in order, via
-        :meth:`send` / :meth:`recv`; cross-rank slices move through the
-        communicator.
+        Process the rank-invariant vparam list one chunk at a time, and within a
+        chunk use the "approach 2" ordering: pack the chunk's src -> RELEASE src
+        -> exchange -> CREATE the chunk's dst -> unpack. Because a chunk's src is
+        freed before its dst is built, the two never coexist; the resident
+        endpoints just swap ``src_all -> dst_all`` across chunks and the only
+        overhead is the chunk's staging working set. (The pre-chunking batched
+        path built ALL dst then released ALL src, costing ~2x the shard plus 2x
+        the staging cap.) See docs/buffer_opt/reshard-peak-memory.md.
+
+        Self-rank slices (a survival rank that is both sender and receiver) go
+        through the communicator self-copy queue: enqueued as clones during the
+        send collect (so they survive the src release), drained into dst during
+        the recv collect -- which now runs AFTER dst is created, so a self-copy
+        obeys the same src-released-before-dst-created ordering as cross-rank.
         """
-        send_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
-        recv_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
-        recv_copy_back: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        src_to_release: List[OptimizerTensorInfo] = []
-        src_to_release_padded: List[OptimizerTensorInfo] = []
+        if self.fake_transfer:
+            # Connection pre-build only: build_nccl_connection_context monkey-
+            # patches every optimizer-tensor memory op to a no-op, so the sole
+            # effect here is the self.send(None)/self.recv(None) NCCL connection
+            # builds inside _collect_send/_collect_recv. That 2-rank build is
+            # order-sensitive, so reproduce the ORIGINAL per-param send-then-recv
+            # traversal (the chunked ordering below is for the real transfer).
+            self._build_main_process_connections(virtual_params)
+            return
+
         timings: dict[str, float] | None = {} if self._log_transfer_timing else None
-
-        with self._timed(timings, "Collect tasks"):
-            for virtual_param in virtual_params:
-                if self._should_skip_virtual_param(virtual_param):
-                    continue
-
-                reshard_plan: ReshardPlan = virtual_param.reshard_plan
-                src_info = virtual_param.src_optimizer_tensor_info
-                dst_info = virtual_param.dst_optimizer_tensor_info
-
-                # When this rank holds both sides (self/survival transfer) src and
-                # dst must carry the same ordered state set -- slices are zipped
-                # positionally. Always holds for Adam (both = 3 states).
-                if src_info is not None and dst_info is not None:
-                    assert src_info.state_names == dst_info.state_names, (
-                        f"src/dst optimizer state set mismatch: {src_info.state_names} "
-                        f"vs {dst_info.state_names}; heterogeneous state sets are "
-                        "unsupported."
-                    )
-
-                # Sender side: collect cross-rank sends, schedule releases.
-                if src_info is not None:
-                    src_to_release_padded.append(src_info)
-                    send_range = reshard_plan.global_send_info.get(self._rank)
-                    if send_range is not None:
-                        self._collect_send(send_range, src_info, send_tasks)
-                        src_to_release.append(src_info)
-
-                # Receiver side (aligned rank only): allocate the padded buffer
-                # then collect cross-rank receives into it.
-                is_aligned_receiver = (
-                    reshard_plan.data_parallel_resharding_info.dst_aligned_global_rank
-                    == self._rank
-                )
-                if is_aligned_receiver:
-                    assert dst_info is not None, (
-                        f"rank {self._rank} is the aligned recv rank of param "
-                        f"(name={virtual_param.name}) but dst_optimizer_tensor_info "
-                        "is None."
-                    )
-                    recv_range = reshard_plan.global_recv_info.get(self._rank)
-                    assert recv_range is not None, (
-                        f"rank {self._rank} is the aligned recv rank of param "
-                        f"(name={virtual_param.name}) but recv info is None."
-                    )
-                    dst_info.create_padded_optimizer_tensor()
-                    dst_info.rebuild()
-                    self._collect_recv(recv_range, dst_info, recv_tasks, recv_copy_back)
+        # Chunk granularity: ~one staging cap worth of optimizer state per chunk
+        # (cap bytes / the per-numel state byte size). The cut is by rank-
+        # invariant vparam numel so every rank chunks identically (else the
+        # per-peer butterfly desyncs). None/<=0 cap => a single chunk.
+        budget_numel = (
+            max(
+                1,
+                self._max_inflight_bytes
+                // self._resolve_state_bytes_per_numel(virtual_params),
+            )
+            if self._max_inflight_bytes and self._max_inflight_bytes > 0
+            else None
+        )
+        self.batched_transfer.last_phase_ms = (
+            {"pack": 0.0, "comm": 0.0, "unpack": 0.0} if timings is not None else None
+        )
 
         with self._timed(timings, "Transfer"):
-            self.batched_transfer.transfer(
-                send_tasks,
-                recv_tasks,
-                pack=self._pack,
-                max_inflight_bytes=self._max_inflight_bytes,
-                collect_phase_ms=timings is not None,
-            )
+            for chunk in self._chunk_virtual_params(virtual_params, budget_numel):
+                self._main_process_chunk(chunk)
+
         if timings is not None and self.batched_transfer.last_phase_ms:
             for phase, ms in self.batched_transfer.last_phase_ms.items():
                 timings[f"Transfer/{phase}"] = ms
-
-        with self._timed(timings, "Copy recv tensors"):
-            for recv_slice, recv_buffer in recv_copy_back:
-                recv_slice.data.copy_(recv_buffer)
-
-        with self._timed(timings, "Release optimizer tensors"):
-            for optimizer_tensor_info in src_to_release:
-                optimizer_tensor_info.release()
-            for optimizer_tensor_info in src_to_release_padded:
-                optimizer_tensor_info.release_padded_optimizer_tensor()
-
         if timings is not None and self._rank == 0:
             summary = "  ".join(f"{name}: {ms:.2f}ms" for name, ms in timings.items())
             print(f"[ElasticMegatron-Transfer] {summary}", flush=True)
+
+    def _main_process_chunk(self, chunk: List[VirtualParam]):
+        """Run the approach-2 ordering (pack -> release src -> exchange -> create
+        dst -> unpack) for one rank-invariant chunk of vparams."""
+        # Phase 1 -- collect this chunk's cross-rank SENDS. Self-edges enqueue src
+        # clones into the communicator self-copy queue (drained in phase 5, after
+        # dst exists). dst is NOT touched here.
+        send_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        src_to_release: List[OptimizerTensorInfo] = []
+        src_to_release_padded: List[OptimizerTensorInfo] = []
+        for virtual_param in chunk:
+            if self._should_skip_virtual_param(virtual_param):
+                continue
+            src_info = virtual_param.src_optimizer_tensor_info
+            dst_info = virtual_param.dst_optimizer_tensor_info
+            # When this rank holds both sides (survival/self transfer) src and dst
+            # must carry the same ordered state set -- slices zip positionally.
+            if src_info is not None and dst_info is not None:
+                assert src_info.state_names == dst_info.state_names, (
+                    f"src/dst optimizer state set mismatch: {src_info.state_names} "
+                    f"vs {dst_info.state_names}; heterogeneous state sets are "
+                    "unsupported."
+                )
+            if src_info is None:
+                continue
+            src_to_release_padded.append(src_info)
+            send_range = virtual_param.reshard_plan.global_send_info.get(self._rank)
+            if send_range is not None:
+                self._collect_send(send_range, src_info, send_tasks)
+                src_to_release.append(src_info)
+
+        # Phase 2 -- size the recv staging from dst PLACEHOLDER metadata + the recv
+        # ranges (no dst allocation), so create-dst can stay after the exchange.
+        recv_nbytes = self._chunk_recv_nbytes(chunk)
+
+        # Phase 3 -- pack src into send staging, then RELEASE src (its bytes are
+        # now staged) BEFORE the comm: this is what keeps src and dst from
+        # coexisting (approach 2). The self-edge clones already hold their bytes.
+        staged = self.batched_transfer.pack(send_tasks)
+        for src_info in src_to_release:
+            src_info.release()
+
+        # Phase 4 -- butterfly exchange over staging only (src freed, dst absent).
+        received = self.batched_transfer.exchange(staged, recv_nbytes)
+        del staged
+
+        # Phase 5 -- CREATE dst, collect recv landings (this drains the deferred
+        # self-copies into dst), then unpack staging -> dst and copy back strided.
+        recv_tasks: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        recv_copy_back: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for virtual_param in chunk:
+            if self._should_skip_virtual_param(virtual_param):
+                continue
+            reshard_plan: ReshardPlan = virtual_param.reshard_plan
+            if (
+                reshard_plan.data_parallel_resharding_info.dst_aligned_global_rank
+                != self._rank
+            ):
+                continue
+            dst_info = virtual_param.dst_optimizer_tensor_info
+            assert dst_info is not None, (
+                f"rank {self._rank} is the aligned recv rank of param "
+                f"(name={virtual_param.name}) but dst_optimizer_tensor_info is None."
+            )
+            recv_range = reshard_plan.global_recv_info.get(self._rank)
+            assert recv_range is not None, (
+                f"rank {self._rank} is the aligned recv rank of param "
+                f"(name={virtual_param.name}) but recv info is None."
+            )
+            dst_info.create_padded_optimizer_tensor()
+            dst_info.rebuild()
+            self._collect_recv(recv_range, dst_info, recv_tasks, recv_copy_back)
+
+        self.batched_transfer.unpack(received, recv_tasks)
+        del received
+        for recv_slice, recv_buffer in recv_copy_back:
+            recv_slice.data.copy_(recv_buffer)
+
+        # Phase 6 -- swap padded src buffers back to origin (metadata only; the
+        # storage was already freed by release() in phase 3).
+        for src_info in src_to_release_padded:
+            src_info.release_padded_optimizer_tensor()
+
+    def _chunk_recv_nbytes(self, chunk: List[VirtualParam]) -> Dict[int, int]:
+        """Per-peer recv byte counts for a chunk, derived from dst PLACEHOLDER
+        metadata WITHOUT allocating dst -- so :meth:`_main_process_chunk` can keep
+        create-dst after the exchange.
+
+        ``release`` resizes a state tensor's storage to 0 but leaves its shape and
+        dtype, so the placeholder still answers ``element_size``. For each
+        aligned-receiver vparam, every ``(src_rank -> recv_param_range)`` edge
+        contributes ``recv_param_range.size * sum(state element_size)`` bytes; the
+        sender packs exactly that for the edge (same range, matching state dtypes
+        by I-15), so both ends agree without a collective. Self-edges
+        (``src == self``) are excluded -- they go through the deferred self-copy,
+        not NCCL. :meth:`BatchedTransfer.unpack` asserts these totals against the
+        realised dst layout."""
+        recv_nbytes: Dict[int, int] = defaultdict(int)
+        for virtual_param in chunk:
+            if self._should_skip_virtual_param(virtual_param):
+                continue
+            reshard_plan: ReshardPlan = virtual_param.reshard_plan
+            if (
+                reshard_plan.data_parallel_resharding_info.dst_aligned_global_rank
+                != self._rank
+            ):
+                continue
+            dst_info = virtual_param.dst_optimizer_tensor_info
+            recv_range = reshard_plan.global_recv_info.get(self._rank)
+            if dst_info is None or recv_range is None:
+                continue
+            bytes_per_numel = sum(t.element_size() for t in dst_info.optimizer_tensors)
+            for src_rank, recv_param_range in recv_range.items():
+                if src_rank == self._rank:
+                    continue
+                recv_nbytes[src_rank] += recv_param_range.size * bytes_per_numel
+        return recv_nbytes
+
+    def _build_main_process_connections(self, virtual_params: List[VirtualParam]):
+        """Fake-transfer path: reproduce the ORIGINAL per-param send-then-recv
+        traversal so the order-sensitive 2-rank NCCL connection build (issued by
+        _collect_send / _collect_recv via self.send(None) / self.recv(None)) is
+        identical to the pre-chunking behaviour. Every optimizer-tensor memory op
+        is a no-op here (build_nccl_connection_context), and the collectors return
+        right after building the connection, so the scratch task dicts stay empty
+        and no real memory moves."""
+        scratch_send: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        scratch_recv: Dict[int, List[torch.Tensor]] = defaultdict(list)
+        scratch_copy_back: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for virtual_param in virtual_params:
+            if self._should_skip_virtual_param(virtual_param):
+                continue
+            reshard_plan: ReshardPlan = virtual_param.reshard_plan
+            src_info = virtual_param.src_optimizer_tensor_info
+            dst_info = virtual_param.dst_optimizer_tensor_info
+            if src_info is not None and dst_info is not None:
+                assert src_info.state_names == dst_info.state_names, (
+                    f"src/dst optimizer state set mismatch: {src_info.state_names} "
+                    f"vs {dst_info.state_names}; heterogeneous state sets are "
+                    "unsupported."
+                )
+            if src_info is not None:
+                send_range = reshard_plan.global_send_info.get(self._rank)
+                if send_range is not None:
+                    self._collect_send(send_range, src_info, scratch_send)
+            if (
+                reshard_plan.data_parallel_resharding_info.dst_aligned_global_rank
+                == self._rank
+            ):
+                assert dst_info is not None, (
+                    f"rank {self._rank} is the aligned recv rank of param "
+                    f"(name={virtual_param.name}) but dst_optimizer_tensor_info "
+                    "is None."
+                )
+                recv_range = reshard_plan.global_recv_info.get(self._rank)
+                assert recv_range is not None, (
+                    f"rank {self._rank} is the aligned recv rank of param "
+                    f"(name={virtual_param.name}) but recv info is None."
+                )
+                dst_info.create_padded_optimizer_tensor()
+                dst_info.rebuild()
+                self._collect_recv(
+                    recv_range, dst_info, scratch_recv, scratch_copy_back
+                )
 
     def _post_process(self, virtual_param: VirtualParam):
         """Post Process. For receiver, unshuffle swiglu and scatter param to dp ranks(ZeRO-1), and release all padded optimizer tensors."""

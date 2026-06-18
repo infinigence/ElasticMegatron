@@ -274,13 +274,18 @@ class BatchedTransfer:
     """Batched, packed, deadlock-safe cross-rank exchange built on a
     :class:`Communicator`.
 
-    :meth:`transfer` is the single transport entry point for a reshard's main
-    exchange. The packed path coalesces each peer's slices through a pair of
-    REUSED uint8 GPU staging buffers, split into byte chunks of at most
-    ``max_inflight_bytes`` — so staging residency is bounded by ~2x the cap
-    regardless of model size. Chunk boundaries are derived independently on both
-    ranks of a pair from the same ordered slice list (see chunk_schedule.py), so
-    the packed path needs no collective exchange.
+    :meth:`transfer` is the all-in-one transport entry point (used by _pre/_post
+    DP gather-scatter and the no-pack legacy). The packed path coalesces each
+    peer's slices through a pair of REUSED uint8 GPU staging buffers, split into
+    byte chunks of at most ``max_inflight_bytes`` — so staging residency is
+    bounded by ~2x the cap regardless of model size. Chunk boundaries are derived
+    independently on both ranks of a pair from the same ordered slice list (see
+    chunk_schedule.py), so the packed path needs no collective exchange.
+
+    For the reshard main process, the same exchange is exposed split into
+    :meth:`pack` / :meth:`exchange` / :meth:`unpack` so the caller can release a
+    chunk's src after pack and create its dst after exchange (flat-peak
+    approach-2); see those methods.
     """
 
     def __init__(self, communicator: "Communicator"):
@@ -430,6 +435,144 @@ class BatchedTransfer:
                 if r_chunk is not None:
                     with self._phase("unpack"):
                         self._unpack_chunk(recv_bytes, recv_sizes, r_chunk, r_stage)
+
+    # ------------------------------------------------------------------------
+    # Phase-split entry points (pack / exchange / unpack)
+    #
+    # The single :meth:`transfer` above reads src and writes dst inside one call,
+    # so the caller must have both endpoints live across it. The reshard
+    # main-process flat-peak path needs to RELEASE a chunk's src before the comm
+    # and CREATE its dst after, so a chunk's src and dst never coexist. These
+    # three methods split :meth:`transfer` at exactly those two seams:
+    #
+    #   staged   = pack(send_tasks)        # reads src  -> caller releases src
+    #   received = exchange(staged, nbytes)# staging only (src gone, dst absent)
+    #   ...                                # caller creates dst
+    #   unpack(received, recv_tasks)       # writes dst
+    #
+    # ``exchange`` keeps the butterfly pairing / ordering of :meth:`transfer`
+    # verbatim — the deadlock-critical machinery is untouched — and touches ONLY
+    # the staging byte-buffers (the chain src -> pack -> staging -> [NCCL] ->
+    # staging -> unpack -> dst means the comm never references src/dst). They are
+    # additive: ``transfer`` is unchanged and still serves _pre/_post and the
+    # no-pack legacy. ``max_inflight_bytes`` is consumed by the caller's CHUNK
+    # granularity here, so a single ``batch_isend_irecv`` per peer carries the
+    # whole (cap-sized) chunk; the within-peer cap-loop is not re-run.
+    # ------------------------------------------------------------------------
+
+    def pack(
+        self, send_tasks: Dict[int, List[torch.Tensor]]
+    ) -> Dict[int, torch.Tensor]:
+        """Pack each peer's send slices into one contiguous uint8 GPU staging
+        buffer. Returns ``{peer: send_staging}``.
+
+        After ``pack`` returns, the source optimizer tensors may be released —
+        their bytes now live in the staging buffers (the pack copy doubles as the
+        CPU->GPU stage-in for offloaded state, exactly as in :meth:`transfer`).
+        Self-rank sends are not here; the caller routes them through the
+        communicator self-copy queue. A no-op in fake_transfer mode (the caller's
+        collectors built the connections; nothing to move)."""
+        if self._comm._build_nccl_connection_only:
+            return {}
+        staged: Dict[int, torch.Tensor] = {}
+        for peer, slices in send_tasks.items():
+            if not slices:
+                continue
+            send_bytes = [t.contiguous().view(torch.uint8).reshape(-1) for t in slices]
+            sizes = [b.numel() for b in send_bytes]
+            total = sum(sizes)
+            if total == 0:
+                continue
+            buf = torch.empty(
+                total, dtype=torch.uint8, device=torch.cuda.current_device()
+            )
+            with self._phase("pack"):
+                self._pack_chunk(send_bytes, sizes, (0, total), buf)
+            staged[peer] = buf
+        return staged
+
+    def exchange(
+        self,
+        send_staging: Dict[int, torch.Tensor],
+        recv_nbytes: Dict[int, int],
+    ) -> Dict[int, torch.Tensor]:
+        """Butterfly-exchange pre-packed staging buffers with every peer; return
+        ``{peer: recv_staging}``.
+
+        ``recv_nbytes[peer]`` is the number of bytes to receive from ``peer``,
+        sized by the caller from dst placeholder metadata (NOT the dst tensors,
+        which may not exist yet) so the dst allocation can stay AFTER this call.
+        One recv staging buffer is allocated per peer; one ``batch_isend_irecv``
+        per pair, with the same peer pairing and send/recv ordering as
+        :meth:`transfer` (lower rank sends first) — deadlock-safe. Touches ONLY
+        staging buffers."""
+        comm = self._comm
+        if comm._build_nccl_connection_only:
+            return {}
+        world_size = torch.distributed.get_world_size()
+        num_steps = 1 << ((world_size - 1).bit_length())
+        received: Dict[int, torch.Tensor] = {}
+        for step in range(1, num_steps):
+            peer = comm._rank ^ step
+            if peer >= world_size:
+                continue
+            s_stage = send_staging.get(peer)
+            has_send = s_stage is not None and s_stage.numel() > 0
+            r_bytes = recv_nbytes.get(peer, 0)
+            if not has_send and r_bytes <= 0:
+                continue
+            r_stage = None
+            if r_bytes > 0:
+                r_stage = torch.empty(
+                    r_bytes, dtype=torch.uint8, device=torch.cuda.current_device()
+                )
+                received[peer] = r_stage
+            batch = comm.batch_p2p()
+            # Lower-ranked peer enqueues its send first, higher-ranked its recv
+            # first; batch_isend_irecv preserves enqueue order — no deadlock.
+            if comm._rank < peer:
+                if has_send:
+                    batch.isend(s_stage, dst=peer)
+                if r_stage is not None:
+                    batch.irecv(r_stage, src=peer)
+            else:
+                if r_stage is not None:
+                    batch.irecv(r_stage, src=peer)
+                if has_send:
+                    batch.isend(s_stage, dst=peer)
+            with self._phase("comm"):
+                batch.wait()
+        return received
+
+    def unpack(
+        self,
+        received: Dict[int, torch.Tensor],
+        recv_tasks: Dict[int, List[torch.Tensor]],
+    ) -> None:
+        """Scatter each peer's recv staging buffer back into the destination
+        landing slices (dst now created). The byte copy doubles as the GPU->CPU
+        stage-out for offloaded dst state. Slice order matches the sender's
+        :meth:`pack`, so the bytes line up. A no-op in fake_transfer mode."""
+        if self._comm._build_nccl_connection_only:
+            return
+        for peer, slices in recv_tasks.items():
+            if not slices:
+                continue
+            r_stage = received.get(peer)
+            if r_stage is None:
+                continue
+            recv_bytes = [t.view(torch.uint8).reshape(-1) for t in slices]
+            sizes = [b.numel() for b in recv_bytes]
+            total = sum(sizes)
+            if total == 0:
+                continue
+            assert r_stage.numel() == total, (
+                f"recv staging for peer {peer} is {r_stage.numel()} bytes but the "
+                f"landing slices need {total}; the recv_nbytes metadata disagrees "
+                "with the dst layout (see _chunk_recv_nbytes)."
+            )
+            with self._phase("unpack"):
+                self._unpack_chunk(recv_bytes, sizes, (0, total), r_stage)
 
     def _enqueue_unpacked(
         self,
