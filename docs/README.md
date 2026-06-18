@@ -6,13 +6,13 @@
 >
 > **在 worktree `../em-pack-peak`(分支 `fix/transfer-flat-peak`)里干活,不是主 checkout。** 按本仓 `CLAUDE.md` onboard:读本文件下方的 **"Current state / handoff (2026-06-18)"** 块 → `buffer_opt/reshard-peak-memory.md`(设计)→ `buffer_opt/reshard-flat-peak-plan.md`(**Task 3 §3a–3e 就是下一步**)。耐用结论也在跨会话 memory 里。
 >
-> **现状:** 传输峰值从 `max(src,dst)` 回归成了 `~2×shard+2×cap`;修复 = chunked **approach-2**(`pack src → 释放 src → comm → 建 dst → unpack`),峰值 `= max(src,dst)+chunk_size`。**Task 1 已完成**(`dbd6975` chunker + `233317b` accessor 修正)。**机制已定**(`8913704`:phase-split `pack/exchange/unpack`、self-copy 延迟到 unpack —— 已证 deadlock-safe)。**Task 3 = 下一步。**
+> **现状(2026-06-18 更新):Task 3 已实现 + 已对抗式 review;下一步 = A100 bit-exact 验证(唯一未做的门)。** 传输峰值从 `max(src,dst)` 回归成 `~2×shard+2×cap`;修复 = chunked **approach-2**(`pack src → 释放 src → comm → 建 dst → unpack`),峰值 `= max(src,dst)+chunk_size`。Task 1(`dbd6975`+`233317b`)、机制(`8913704`)早已定。**已落代码:** `8a128e5`(chunked approach-2 `_main_process` + `BatchedTransfer.pack/exchange/unpack` + `_chunk_recv_nbytes` 从 dst 占位符 metadata 定尺寸 + fake 模式单独 `_build_main_process_connections` 保原连接顺序)、`286d709`(`ELASTIC_TRANSFER_PEAK_PROBE` 探针)、`647b693`(review 发现的修复:approach-2 在 comm 前 `release()` src,**pinned host(cpu-offload)src** 的异步 H2D pack copy 会和 host 端 free 竞态撕字节 → 加显式 `current_stream().synchronize()`,只在有 host src 时,GPU-adam 不付代价)。
 >
-> **自验进度:** `git -C ../em-pack-peak log --oneline -10`;`elastic_megatron/transfer/transfer.py` 的 `_main_process` 仍是批量-全量版(Task 3 未落);`PYTHONPATH=.:$MEGATRON_PATH python3 tests/test_transfer_chunking.py`(机器上 PASS,本机 SKIP)。
+> **自验进度:** `git -C ../em-pack-peak log --oneline -6`;`_main_process` 现在是 dispatcher(fake → 连接预建分支;real → 逐 chunk approach-2);`PYTHONPATH=.:$MEGATRON_PATH python3 tests/test_transfer_chunking.py`(机器上 PASS,本机 SKIP)。
 >
-> **做 Task 3(§3a–3e):** 给 `BatchedTransfer` 加 `pack()/exchange()/unpack()`(`exchange` 里的 butterfly **原样照搬**;`transfer()` 保留给 `_pre/_post` + no-pack);`_main_process` 改成逐 chunk 循环;**recv staging 尺寸用 dst 占位符 metadata + recv ranges 算,不用已分配的 dst**(这样 create-dst 才能留在 comm 之后);**self-copy 延迟到 unpack**。护栏:padded 释放仍留 `_post_process`;`_pre/_post` 不动;保持 I-16。
+> **Task 3 已做完(§3a–3e 全落)** —— 不要重做。机制:`BatchedTransfer.pack()/exchange()/unpack()`(`exchange` butterfly 原样照搬;`transfer()` 仍服务 `_pre/_post`+no-pack);recv staging 用 metadata 定尺寸(`release()` 后 shape/dtype 还在);self-copy 复用已有队列延迟到 unpack;I-16 + padded 释放时序保持。
 >
-> **续接纪律:** 别重跑已定的设计/死锁调查(已结晶进 docs+memory);sub-agent 重新 spawn、别复用旧 ID;每次 commit 跑 py_compile + ruff + `test_transfer_chunking.py`。**Task 3 之后:** 对抗式 review workflow → **A100 bit-exact `verify_all`**(CPU_OFFLOAD=0 GPU-adam **和** =1 cpu-adam,pack on/off)+ `ELASTIC_TRANSFER_PEAK_PROBE` 探针 —— **ckpt 走 off-NFS `/tmp`,起 GPU 前先确认 A100 空闲。**
+> **续接纪律:** 别重跑已定的设计/死锁调查(已结晶进 docs+memory);sub-agent 重新 spawn、别复用旧 ID;每次 commit 跑 py_compile + ruff + `test_transfer_chunking.py`。**唯一剩下的门 = A100 bit-exact `verify_all`**(CPU_OFFLOAD=0 GPU-adam **和** =1 cpu-adam,pack on/off)+ `ELASTIC_TRANSFER_PEAK_PROBE` 探针 —— **ckpt 走 off-NFS `/tmp`,起 GPU 前先确认 A100 空闲。**
 >
 > **别混淆:** **30B 间歇性卡死**(`feat/hostmem-30b-hang`,卡在 shrink 后的 "building GPT model")是**另一个独立未决问题**(疑似 NCCL-group/c10d 竞态;需 3–5× 反复跑 + py-spy),**不是** flat-peak 这条线。
 >
@@ -45,10 +45,12 @@ branches/worktrees:
    - **Plan** → [`buffer_opt/reshard-flat-peak-plan.md`](buffer_opt/reshard-flat-peak-plan.md):
      mechanism **RESOLVED** (split `BatchedTransfer.transfer` into `pack()/exchange()/unpack()`,
      `exchange` keeps the butterfly verbatim; defer survival-rank self-copy to unpack — confirmed
-     deadlock-safe by the `transfer-order-investigator` sub-agent + user). **Task 1 DONE** (`dbd6975`:
-     rank-invariant chunker + derived per-numel). **Task 3 (the `_main_process` rewrite) is the
-     immediate NEXT step** (concrete §3a–3e; the one subtlety: recv staging is sized from dst
-     placeholder metadata + recv ranges, NOT allocated dst, so create-dst stays after the comm).
+     deadlock-safe by the `transfer-order-investigator` sub-agent + user). **Task 1 DONE** (`dbd6975`).
+     **Task 3 DONE + adversarially reviewed** (`8a128e5` chunked approach-2 `_main_process` +
+     `BatchedTransfer.pack/exchange/unpack` + `_chunk_recv_nbytes` from dst placeholder metadata +
+     fake-mode `_build_main_process_connections`; `286d709` peak probe; `647b693` review fix =
+     barrier the async H2D pack copy before releasing **pinned host** cpu-offload src). **Only the
+     A100 bit-exact verify remains** (§Task 5).
    - Verify: adversarial-review workflow → A100 bit-exact `verify_all` (CPU_OFFLOAD=0 GPU-adam AND
      =1 cpu-adam, pack on/off) + the `ELASTIC_TRANSFER_PEAK_PROBE` peak probe.
 
@@ -76,9 +78,13 @@ branches/worktrees:
 > A 4th worktree `../em-buffer-opt` (`fix/transfer-staging-residency`) is a **separate / parked**
 > staging-residency experiment — **not part of this flat-peak work**.
 
-**Immediate next step:** implement **Task 3** of `reshard-flat-peak-plan.md` on `fix/transfer-flat-peak`,
-then adversarial-review workflow, then A100 bit-exact verify. The durable findings (codex review
-verdict, the flat-peak regression, the intermittent hang) also live in cross-session memory.
+**Immediate next step:** **A100 bit-exact `verify_all`** for the now-landed Task 3 on
+`fix/transfer-flat-peak` — CPU_OFFLOAD=0 (GPU-adam, the regressed path) AND =1 (cpu-adam), pack on/off,
+plus the `ELASTIC_TRANSFER_PEAK_PROBE` peak check; ckpt off-NFS `/tmp`; confirm A100 is free first.
+Task 3 itself is implemented (`8a128e5`/`286d709`/`647b693`) and adversarially reviewed (0 confirmed
+bugs; the cpu-adam pinned-src hazard the review surfaced is fixed by `647b693`). The durable findings
+(codex review verdict, the flat-peak regression + Task 3 landing, the intermittent hang) live in
+cross-session memory.
 
 ## If you are a new agent picking up this repo
 
