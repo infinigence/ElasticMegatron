@@ -81,7 +81,7 @@ vparam list one rank-invariant chunk at a time; WITHIN a chunk use the **"approa
 that keeps a chunk's src and dst from coexisting:
 
 ```
-for chunk in chunk_params(all_vps, budget):     # rank-invariant cut by vparam.size
+for chunk in chunk_params(all_vps, budget):     # rank-invariant cut by vparam.numel()
     pack chunk's src slices -> send staging
     RELEASE chunk's src optimizer tensors         # ← before the comm
     exchange (cross-rank butterfly: send staging / recv staging)
