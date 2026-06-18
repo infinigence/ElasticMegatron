@@ -332,6 +332,64 @@ class TransferManager:
                     recv_copy_back.append((recv_slice, recv_buffer))
                 recv_tasks[src_rank].append(recv_buffer)
 
+    @staticmethod
+    def _virtual_param_global_numel(virtual_param: VirtualParam) -> int:
+        """Rank-invariant global element count of a vparam (its ``size`` property).
+        Used ONLY to cut chunk boundaries identically on every rank — it must not
+        depend on per-rank ownership, or the per-peer butterfly p2p desyncs."""
+        return virtual_param.size
+
+    def _resolve_state_bytes_per_numel(
+        self, virtual_params: List[VirtualParam]
+    ) -> int:
+        """Sum(element_size) over a param's optimizer states (master + moments),
+        DERIVED from the actual OptimizerTensorInfo the adapter populated — never
+        hardcoded. Adam-fp32 => 4+4+4 = 12; mixed-precision / non-Adam optimizers
+        come out right automatically (each state carries its own dtype, I-15). Read
+        from whatever info THIS rank holds, then all-reduce MAX so every rank uses
+        the SAME value (ranks holding no param contribute 0) — required because the
+        chunk budget (numel) derives from it and the boundaries must be
+        rank-identical. Runs inside with_world_group(union), like
+        :meth:`_resolve_staging_cap`."""
+        local = 0
+        for virtual_param in virtual_params:
+            info = (
+                virtual_param.src_optimizer_tensor_info
+                or virtual_param.dst_optimizer_tensor_info
+            )
+            if info is not None:
+                local = sum(t.element_size() for t in info.optimizer_tensors)
+                break
+        flag = torch.tensor(
+            [local], device=torch.cuda.current_device(), dtype=torch.int64
+        )
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return max(1, int(flag.item()))
+
+    def _chunk_virtual_params(
+        self, virtual_params: List[VirtualParam], budget_numel: int | None
+    ):
+        """Yield consecutive chunks of ``virtual_params`` whose combined global numel
+        stays under ``budget_numel``. Boundaries depend ONLY on the rank-invariant
+        global vparam sizes, so every rank cuts identically and the per-chunk
+        butterfly p2p stays in lockstep. ``budget_numel`` None / <= 0 => a single
+        chunk (today's all-at-once behaviour). An oversized single vparam is never
+        split — it forms its own chunk."""
+        if not budget_numel or budget_numel <= 0:
+            yield list(virtual_params)
+            return
+        chunk: List[VirtualParam] = []
+        acc = 0
+        for virtual_param in virtual_params:
+            vp_numel = self._virtual_param_global_numel(virtual_param)
+            if chunk and acc + vp_numel > budget_numel:
+                yield chunk
+                chunk, acc = [], 0
+            chunk.append(virtual_param)
+            acc += vp_numel
+        if chunk:
+            yield chunk
+
     def _main_process(self, virtual_params: List[VirtualParam]):
         """Execute the cross-rank transfer plan for every param.
 
