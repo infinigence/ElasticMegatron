@@ -264,6 +264,19 @@ class OptimizerAdapter:
         """
         return
 
+    def repair_per_param_step(self) -> None:
+        """Restore any per-param optimizer ``step`` the reshard could not carry.
+
+        Default: nothing. The reshard transfers only param-shaped state (master +
+        moments); the scalar per-param ``step`` is dropped (I-15). For every
+        optimizer here except the CPU-offload one, the step that matters lives in
+        ``param_groups`` (broadcast by ``transfer_opt_param_scheduler``), so no
+        per-param repair is needed. Only HybridDeviceOptimizer's CPU sub-optimizers
+        (stock ``torch.optim.AdamW``) keep the step *per param* — see
+        :meth:`HybridDeviceOptimizerAdapter.repair_per_param_step`.
+        """
+        return
+
 
 class Float16OptimizerAdapter(OptimizerAdapter):
     """Non-distributed float16 optimizer: master lives in fp32_from_float16_groups."""
@@ -475,3 +488,50 @@ class HybridDeviceOptimizerAdapter(PrecisionAwareOptimizerAdapter):
         # gear's next step (it keys on `param not in self.cpu_copy_map_grad`).
         hdo.cpu_copy_map_grad.clear()
         trim_host_memory()
+
+    def repair_per_param_step(self) -> None:
+        """Seed the offloaded params' per-param Adam ``step`` to the src step.
+
+        HDO's CPU sub-optimizers are stock ``torch.optim.AdamW``, whose bias
+        correction (``1 - beta**t``) reads the PER-PARAM ``state[p]["step"]`` — NOT
+        ``param_groups["step"]`` (only the GPU FusedAdam consumes that one). The
+        reshard never transfers per-param step (dropped as non-param-shaped, I-15)
+        and the dst init seeds it to a 0 placeholder (``_init_empty_hdo_state``).
+        Left unrepaired, the dst's offloaded params would resume their first
+        post-reshard step with t=1 bias correction instead of the real src step,
+        diverging the cpu-adam update on exactly the offloaded subset — a silent
+        change the optim-state-multiset verify (master/exp_avg/exp_avg_sq only)
+        cannot see. The agreed src step is already in ``param_groups`` (broadcast by
+        ``transfer_opt_param_scheduler`` before this runs); copy it into every CPU
+        sub-optimizer's per-param step so the next step increments to src_step+1,
+        matching the src's continuity. Runs on every dst-active rank. FusedAdam
+        params are intentionally left alone — they read the already-correct
+        ``param_groups`` step.
+        """
+        hdo = self.optimizer.optimizer
+        src_step = None
+        for group in hdo.param_groups:
+            if group.get("params") and "step" in group:
+                src_step = group["step"]
+                break
+        if src_step is None:
+            return
+        step_val = (
+            float(src_step.item()) if torch.is_tensor(src_step) else float(src_step)
+        )
+        touched = False
+        for cpu_optimizer in hdo.cpu_optimizers:
+            for param in _optimizer_param_generator(cpu_optimizer):
+                state = cpu_optimizer.state.get(param)
+                if not state or "step" not in state:
+                    continue
+                step_tensor = state["step"]
+                if torch.is_tensor(step_tensor):
+                    step_tensor.fill_(step_val)
+                else:
+                    state["step"] = step_val
+                touched = True
+        # Re-alias hdo.state to the repaired sub-optimizer state dicts (same idiom
+        # _init_empty_hdo_state uses); harmless no-op if nothing was offloaded.
+        if touched:
+            hdo._sync_sub_optimizers_state_to_hdo()
