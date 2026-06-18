@@ -109,16 +109,7 @@ Expected: `AttributeError`/`ImportError` (`_chunk_virtual_params` / `_RESHARD_ST
 not defined) — on the dev box it will instead print `SKIP` (megatron absent); run the real assertion
 on the A100 box.
 
-- [ ] **Step 3: Implement the const + helpers** (in `transfer.py`, module scope + in `TransferManager`)
-
-```python
-# module scope, near the top
-# Optimizer-state bytes per param element for chunk budgeting: Adam keeps 3
-# param-shaped fp32 states (master + exp_avg + exp_avg_sq), see I-15. This only
-# converts the byte budget into a rank-invariant numel threshold; a non-Adam
-# optimizer would scale it, but the value need only be identical on every rank.
-_RESHARD_STATE_BYTES_PER_NUMEL = 3 * 4
-```
+- [ ] **Step 3: Implement the helpers** (in `TransferManager`; bytes-per-numel is DERIVED, not hardcoded)
 
 ```python
     @staticmethod
@@ -128,17 +119,36 @@ _RESHARD_STATE_BYTES_PER_NUMEL = 3 * 4
         every rank."""
         return virtual_param.size
 
-    def _chunk_virtual_params(self, virtual_params, budget_bytes):
-        """Yield consecutive chunks of ``virtual_params`` whose combined global
-        optimizer-state bytes stay under ``budget_bytes``. Boundaries depend ONLY
-        on the (rank-invariant) global vparam sizes, so every rank cuts identically
-        and the per-chunk butterfly p2p stays in lockstep. ``budget_bytes`` None or
-        <= 0 => a single chunk (today's all-at-once behaviour). A single vparam
-        larger than the budget is never split — it forms its own chunk."""
-        if not budget_bytes or budget_bytes <= 0:
+    def _resolve_state_bytes_per_numel(self, virtual_params) -> int:
+        """Σ(element_size) over a param's optimizer states (master + moments),
+        DERIVED from the actual OptimizerTensorInfo the adapter populated — never
+        hardcoded. Adam-fp32 => 4+4+4 = 12; mixed-precision / non-Adam optimizers
+        come out right automatically (each state carries its own dtype, I-15). Read
+        from whatever info THIS rank holds, then all-reduce MAX so every rank uses
+        the SAME value (ranks holding no param contribute 0) — required because the
+        chunk budget (numel) derives from it and boundaries must be rank-identical.
+        Runs inside with_world_group(union) like _resolve_staging_cap."""
+        local = 0
+        for vp in virtual_params:
+            info = vp.src_optimizer_tensor_info or vp.dst_optimizer_tensor_info
+            if info is not None:
+                local = sum(t.element_size() for t in info.optimizer_tensors)
+                break
+        t = torch.tensor(
+            [local], device=torch.cuda.current_device(), dtype=torch.int64
+        )
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
+        return max(1, int(t.item()))
+
+    def _chunk_virtual_params(self, virtual_params, budget_numel):
+        """Yield consecutive chunks whose combined GLOBAL numel stays under
+        ``budget_numel``. Boundaries depend ONLY on the rank-invariant global vparam
+        sizes, so every rank cuts identically and the per-chunk butterfly p2p stays
+        in lockstep. ``budget_numel`` None => one chunk (today's all-at-once). A
+        single vparam larger than the budget is never split — it forms its own chunk."""
+        if not budget_numel or budget_numel <= 0:
             yield list(virtual_params)
             return
-        budget_numel = max(1, budget_bytes // _RESHARD_STATE_BYTES_PER_NUMEL)
         chunk, acc = [], 0
         for vp in virtual_params:
             vp_numel = self._virtual_param_global_numel(vp)
@@ -150,6 +160,11 @@ _RESHARD_STATE_BYTES_PER_NUMEL = 3 * 4
         if chunk:
             yield chunk
 ```
+
+The test (Step 1) chunks directly in numel: `tm._chunk_virtual_params(vps, budget_numel=200)` →
+`[[100,100],[100,50]]`; `budget_numel=None`/`0` → one chunk; an oversized vparam forms its own chunk.
+`_resolve_state_bytes_per_numel` needs a live process group, so it is exercised on the box, not in
+the torch-free unit test.
 
 - [ ] **Step 4: Run test, verify it passes** (on the box)
 
@@ -233,7 +248,12 @@ git commit -m "refactor(transfer): extract _transfer_chunk from _main_process (n
         The chunk budget is the staging cap; budget None/<=0 => one chunk (today's
         batched behaviour). Coalescing is preserved within each chunk."""
         timings = {} if self._log_transfer_timing else None
-        for chunk in self._chunk_virtual_params(virtual_params, self._max_inflight_bytes):
+        cap = self._max_inflight_bytes
+        if cap and cap > 0:
+            budget_numel = max(1, cap // self._resolve_state_bytes_per_numel(virtual_params))
+        else:
+            budget_numel = None  # no cap => one chunk (today's batched behaviour)
+        for chunk in self._chunk_virtual_params(virtual_params, budget_numel):
             self._transfer_chunk(chunk, timings)
         if timings is not None and self._rank == 0:
             summary = "  ".join(f"{n}: {ms:.2f}ms" for n, ms in timings.items())
@@ -328,8 +348,8 @@ Not a code step — the binding acceptance gate. Run on the freed A100, ckpts of
 1. **Budget = cap exactly** gives peak ≈ `shard + cap + 2×cap` = `shard + 3×cap` (you chose this).
    Confirm you don't want the tighter `shard + 2×cap` (would split the cap between chunk-dst and
    staging — one extra line in `_main_process`). Current plan = `shard + 3×cap`.
-2. **`_RESHARD_STATE_BYTES_PER_NUMEL = 12`** (Adam fp32 ×3) is only a budget→numel scale; it need not
-   be exact, only rank-identical. OK to hardcode (matches the repo's Adam-only I-15 assumption), or
-   prefer deriving it from the optimizer config?
+2. **RESOLVED — derive, don't hardcode.** `_resolve_state_bytes_per_numel` reads Σ(element_size)
+   from the actual `OptimizerTensorInfo` states (master + moments) and all-reduces MAX for
+   rank-identical budget boundaries. Adam-fp32 → 12 automatically; no constant.
 3. Once verified, this **supersedes codex's `_main_process_streaming`** on `feat/hostmem-30b-hang`
    (its cpu-adam-only chunk=1). Fold that branch onto this path in a follow-up, or keep separate?
