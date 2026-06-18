@@ -76,48 +76,45 @@ staging **bytes** inside `batched_transfer.transfer`; it does **not** chunk the 
 
 ## 5. The fix — one chunked flat-peak path
 
-Replace the all-or-nothing batched `_main_process` with a **single chunked path** in which the
-cap/budget drives **both** the staging bytes **and** the param-chunking:
+Generalize the original per-param ordering to a tunable **chunk** granularity. Process the global
+vparam list one rank-invariant chunk at a time; WITHIN a chunk use the **"approach 2" ordering**
+that keeps a chunk's src and dst from coexisting:
 
 ```
-budget = resolve_chunk_budget()                 # from the same free-mode cap
-for chunk in chunk_params_by_dst_bytes(virtual_params, budget):
-    collect_send(chunk)                         # src still resident
-    for vp in chunk: build dst (create_padded + rebuild)
-    batched_transfer.transfer(chunk send/recv)  # intra-chunk coalescing preserved
-    copy_back(chunk)
-    release_src(chunk)                          # ← free this chunk's src before next chunk's dst
+for chunk in chunk_params(all_vps, budget):     # rank-invariant cut by vparam.size
+    pack chunk's src slices -> send staging
+    RELEASE chunk's src optimizer tensors         # ← before the comm
+    exchange (cross-rank butterfly: send staging / recv staging)
+    CREATE chunk's dst optimizer tensors           # ← after the comm
+    unpack recv staging -> chunk's dst
 ```
 
-Invariant restored: **release each chunk's src before allocating the next chunk's dst**, so the
-endpoint stays ≈ 1× shard (src→dst swap), and the only overshoot is one chunk's dst.
+Because each chunk's src is released before its dst is created, the chunk's src and dst never
+coexist; the endpoints just swap `src_all → dst_all` across chunks, and the only resident overhead
+is the chunk's staging working set (`chunk_size` = the send + recv staging tensors).
 
-- **peak = 1× shard + one chunk's dst + `2×cap` staging.**
-- `chunk=1` (small budget) → **per-param**, the original flat peak (= what codex's streaming
-  does). `chunk=∞` → today's 2× behaviour. The budget is the single knob.
-- **Coalescing preserved within a chunk** (the buffer-opt throughput win), lost only at
-  `chunk=1` — same tradeoff streaming makes, now tunable.
-- **Subsumes codex's `_main_process_streaming`** (it becomes the `chunk=1` degenerate) and
-  **fixes GPU-adam too** (not just cpu-adam).
-- **Bit-exactness preserved:** same per-peer butterfly, same deterministic param order, same
-  send/recv slices and release order — only the batch boundary moves. (Same argument that makes
-  codex's streaming bit-exact.)
-- **Cap-timing gap closed:** the peak no longer requires all-dst + all-src at once, so the
-  cap-before-dst computation is no longer unsound — it now bounds the per-chunk transient,
-  and the ~1× shard endpoint was already resident at cap time.
+- **peak = max(src_all, dst_all) + chunk_size**  (baseline `chunk_size ≈ 2×cap`: one send + one recv
+  tensor). Compare the regression's `~2×shard + 2×cap` and the original baseline's
+  `max(src_all, dst_all) + max(one param)`.
+- A less-careful variant (CREATE dst BEFORE the comm, don't release src early) gives
+  `max(src_all, dst_all) + 2×chunk_size` — acceptable, but the release-before-create ordering is
+  tighter and preferred.
+- **`chunk_size` is a KNOB, decoupled from `cap`.** `cap` stays the staging/comm group size WITHIN a
+  chunk (the existing communicator cap-loop); a chunk may hold MULTIPLE cap-groups to overlap
+  gpu-copy/H2D with comm (Phase-2 overlap). Do NOT hardcode `chunk = 2×cap` — leave the interface.
+- `chunk = 1 param` → the original per-param flat peak (= what codex's cpu-adam streaming does);
+  larger chunk → fewer/larger comms (more coalescing) at higher staging cost. **Subsumes codex's
+  `_main_process_streaming`** and fixes GPU-adam too.
+- **Bit-exactness preserved** (same bytes/order; only the release/create timing + batch boundary
+  move). The cap-before-dst over-commit (§3) is also gone — the peak no longer holds all-dst +
+  all-src at once.
 
-### Open decisions (to confirm before coding)
-1. **Budget source.** Reuse the existing free-mode `_resolve_staging_cap()` value as the chunk
-   budget (one knob, matches the original intent), or a separate "endpoint budget"? Proposed:
-   reuse the cap.
-2. **Chunk metric.** Accumulate by **dst rebuild bytes** per chunk (the thing that overshoots).
-   Must be identical on every rank (deterministic param order + identical budget → identical
-   chunk boundaries → NCCL stays in lockstep, like `_should_stream`'s all-reduced decision).
-3. **No-pack path.** Keep `pack=0` routed through the same chunked loop (it already degrades
-   inside `batched_transfer.transfer`).
-4. **Verification.** `verify_all` bit-exact (GPU, off-NFS) with `CPU_OFFLOAD=0` (GPU-adam, the
-   regressed path) **and** `=1` (cpu-adam), pack on/off, plus a peak-reserved-bytes probe to
-   confirm flat peak vs the 2× baseline.
+### The within-chunk comm mechanism is UNDER INVESTIGATION
+The exact `pack → release-src → comm → create-dst → unpack` mechanism (single butterfly with
+release/create around it, vs separate send/recv phases; deadlock-safety with the per-cap-round loop)
+is being investigated by the `transfer-order-investigator` sub-agent — see the plan's Task 2. Chunk
+boundaries are cut by the rank-invariant `vparam.size`; the per-numel byte size is DERIVED from the
+actual `OptimizerTensorInfo` states (all-reduced for rank-identity), not hardcoded.
 
 ## 6. Archive — cpu-adam host-memory / 30B-hang work
 

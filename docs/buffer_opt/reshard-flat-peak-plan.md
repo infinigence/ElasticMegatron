@@ -1,151 +1,124 @@
-# Reshard transfer flat-peak — Implementation Plan
+# Reshard transfer flat-peak — Implementation Plan (v2)
 
 > **For agentic workers:** REQUIRED SUB-SKILL: use superpowers:subagent-driven-development or
-> superpowers:executing-plans to implement this task-by-task. Steps use `- [ ]` checkboxes.
-> Design rationale + the regression it fixes: [`reshard-peak-memory.md`](reshard-peak-memory.md).
+> superpowers:executing-plans to implement task-by-task. Steps use `- [ ]` checkboxes.
+> Design + the regression it fixes: [`reshard-peak-memory.md`](reshard-peak-memory.md).
 
-**Goal:** Make the batched reshard transfer hold a **flat** memory peak (≈ 1× the local
-optimizer-state shard + bounded staging) instead of the current ~2× (all-dst-built + all-src-held),
-restoring the original `main`/`feat/core_r0.16.0` guarantee for **all** optimizers (GPU-adam and
-cpu-adam), without losing buffer-opt's intra-batch NCCL coalescing.
+**Goal:** make the reshard transfer peak `= max(src_all, dst_all) + chunk_size` (vs the regression's
+`~2×shard + 2×cap`), restoring the original per-param flat-peak guarantee at a **tunable chunk
+granularity**, for GPU-adam AND cpu-adam, keeping intra-chunk NCCL coalescing.
 
-**Architecture:** Split the global `all_virtual_params` list into **chunks** sized by a
-rank-invariant budget (each vparam's GLOBAL numel `virtual_param.size`, so every rank cuts at the
-same boundary → NCCL stays in lockstep). Process one chunk at a time: collect sends, build that
-chunk's dst, transfer (coalesced within the chunk), copy back, **release that chunk's src before
-the next chunk's dst is built**. The budget is the existing free-mode staging cap
-(`_max_inflight_bytes`). `budget None/≤0` → one chunk = today's behavior; tiny budget → per-param.
+**Architecture:** Process the global `all_virtual_params` in **rank-invariant chunks** (the
+release/create unit). Within a chunk, use the **"approach 2" ordering** — pack this chunk's src into
+a send staging buffer, **RELEASE the chunk's src**, comm, **CREATE the chunk's dst**, unpack staging
+into dst — so a chunk's src and dst never coexist; the endpoints just swap `src_all → dst_all` across
+chunks and the only resident overhead is the chunk's staging (`chunk_size`). `chunk_size` is a KNOB
+decoupled from `cap`; `cap` stays the staging/comm group size WITHIN a chunk (the existing
+communicator cap-loop), so a chunk can later hold multiple cap-groups to overlap gpu-copy/H2D with
+comm. Branch `fix/transfer-flat-peak` (worktree `../em-pack-peak`, off `ref/buffer-opt-integration`).
 
-**Tech stack:** Python, PyTorch, Megatron-LM 0.16, NCCL `batch_isend_irecv` (butterfly p2p).
-Branch `fix/transfer-flat-peak` (worktree `../em-pack-peak`, off `ref/buffer-opt-integration`).
+**Peak model (per rank, main-process only):**
 
----
+| | peak |
+|---|---|
+| baseline (`main`, per-param) | `max(src_all, dst_all) + max(one param's opt tensors)` |
+| regression (`ref/buffer-opt`) | `~2×shard + 2×cap` (all dst built while all src held) |
+| **target (this fix, approach 2)** | **`max(src_all, dst_all) + chunk_size`**  (chunk_size ≈ 2×cap baseline) |
+| approach 3 (create dst before comm) | `max(src_all, dst_all) + 2×chunk_size` — acceptable fallback, (2) preferred |
 
-## Critical correctness constraint (read first)
+`chunk_size` = the send + recv staging working set. `chunk=1 param` → the original flat peak;
+larger chunk → fewer/larger comms (more coalescing) at higher staging cost.
 
-**Chunk boundaries MUST be identical on every rank.** A chunk is one `batched_transfer.transfer`;
-its butterfly p2p ops only pair up if both ends batch the same vparams. If rank A cuts after vp5 and
-rank B after vp6, A's chunk-1 sends vp1-5 while B expects vp1-6 → desync/hang. Therefore the chunk
-metric must be a pure function of the (globally-identical, identically-ordered) `all_virtual_params`
-list — **not** of per-rank ownership. We use `virtual_param.size` (the param's global numel, set from
-`tensor_parallel_attr.get_model_param_range(tp)`; mirrors `virtual_param.py:40-42`), which is
-rank-invariant for a given reshard. The budget (`_resolve_staging_cap`) is already rank-identical
-(one MIN all-reduce). Same list + same metric + same budget ⇒ identical cuts. A unit test (Task 1)
-locks this in.
+## Critical correctness constraint
+Chunk boundaries MUST be identical on every rank, or the per-peer butterfly p2p desyncs. Cut by the
+**rank-invariant `virtual_param.size`** (global numel; mirrors virtual_param.py:40-42), not per-rank
+ownership. Budget is rank-identical (derived from the rank-identical staging cap + an all-reduced
+per-numel byte size). Task 1's unit test locks the determinism in.
 
 ## File structure
-
-- **Modify** `elastic_megatron/transfer/transfer.py`
-  - add module const `_RESHARD_STATE_BYTES_PER_NUMEL`
-  - add `TransferManager._virtual_param_global_numel(vp)` (rank-invariant size accessor)
-  - add `TransferManager._chunk_virtual_params(vps, budget_bytes)` (generator)
-  - extract `TransferManager._transfer_chunk(chunk, timings)` from the current `_main_process` body
-  - rewrite `TransferManager._main_process(vps)` into the chunk loop
-- **Create** `tests/test_transfer_chunking.py` (rank-invariance + budgeting + degenerate cases)
-- No changes to `_pre_process` / `_post_process` (stay full passes — they already release per-param
-  via `_send_optimizer_tensors`), to `communicator.py` (staging cap unchanged), or to `OptimizerTensorInfo`.
+- **Modify** `elastic_megatron/transfer/transfer.py`: the chunker + derived per-numel (Task 1); the
+  `_main_process` rewrite to the chunked approach-2 ordering (Task 3 — pending Task 2's mechanism).
+- **Possibly modify** `elastic_megatron/transfer/communicator.py`: to expose pack/comm/unpack so the
+  manager can interleave release-src (after pack) and create-dst (before unpack) — **the mechanism is
+  Task 2's deliverable** (under sub-agent investigation; do not pre-decide).
+- **Create** `tests/test_transfer_chunking.py` (Task 1).
 
 ---
 
-### Task 1: rank-invariant chunk helper + tests
+### Task 1: rank-invariant chunker + derived per-numel size (READY — independent of the comm mechanism)
 
-**Files:**
-- Modify: `elastic_megatron/transfer/transfer.py` (module const + 2 methods, after `_main_process`)
-- Test: `tests/test_transfer_chunking.py`
+**Files:** Modify `transfer.py` (3 methods on `TransferManager`); Test `tests/test_transfer_chunking.py`.
 
-- [ ] **Step 1: Write the failing test** (`tests/test_transfer_chunking.py`)
+- [ ] **Step 1: failing test** (`tests/test_transfer_chunking.py`)
 
 ```python
-"""Behavioral test for rank-invariant chunking of the reshard transfer.
-
-Chunk boundaries MUST depend only on the global vparam list (vp.size), never on
-per-rank ownership, or the per-peer NCCL butterfly desyncs. Import needs torch +
-megatron, so this SKIPS where they are unavailable (runs on the A100 box)."""
+"""Rank-invariant chunking of the reshard transfer. Boundaries must depend only on
+the global vparam list (vp.size), never per-rank ownership, or the per-peer NCCL
+butterfly desyncs. Import needs torch+megatron -> SKIPS on the dev box, runs on A100."""
 
 def _load():
     try:
-        from elastic_megatron.transfer.transfer import (
-            TransferManager, _RESHARD_STATE_BYTES_PER_NUMEL,
-        )
-        return TransferManager, _RESHARD_STATE_BYTES_PER_NUMEL
+        from elastic_megatron.transfer.transfer import TransferManager
+        return TransferManager
     except Exception:
-        return None, None
-
+        return None
 
 class _VP:
     def __init__(self, size): self.size = size
 
-
 def test_chunking_deterministic_budget_bounded_and_degenerate():
-    TransferManager, BPN = _load()
+    TransferManager = _load()
     if TransferManager is None:
         print("SKIP test_chunking (torch/megatron unavailable)"); return
-    tm = TransferManager.__new__(TransferManager)  # bypass __init__ (no dist needed)
+    tm = TransferManager.__new__(TransferManager)
     vps = [_VP(100), _VP(100), _VP(100), _VP(50)]
-
-    # budget = 200 numel worth of bytes -> chunks of <=200 numel
-    budget = 200 * BPN
-    chunks = list(tm._chunk_virtual_params(vps, budget))
+    chunks = list(tm._chunk_virtual_params(vps, budget_numel=200))
     assert [[v.size for v in c] for c in chunks] == [[100, 100], [100, 50]]
-    # deterministic: identical inputs -> identical boundaries (rank-invariance proxy)
-    assert chunks == list(tm._chunk_virtual_params(vps, budget))
-    # an oversized single vparam still goes alone (never dropped)
+    assert chunks == list(tm._chunk_virtual_params(vps, 200))          # deterministic
     big = [_VP(10_000), _VP(10)]
-    assert [[v.size for v in c] for c in tm._chunk_virtual_params(big, budget)] == [[10_000], [10]]
-    # degenerate: None / <=0 budget -> exactly one chunk (today's batched behavior)
-    assert list(tm._chunk_virtual_params(vps, None)) == [vps]
+    assert [[v.size for v in c] for c in tm._chunk_virtual_params(big, 200)] == [[10_000], [10]]
+    assert list(tm._chunk_virtual_params(vps, None)) == [vps]          # degenerate -> one chunk
     assert list(tm._chunk_virtual_params(vps, 0)) == [vps]
-
 
 if __name__ == "__main__":
     test_chunking_deterministic_budget_bounded_and_degenerate()
     print("PASS tests/test_transfer_chunking.py")
 ```
 
-- [ ] **Step 2: Run it, verify it fails**
+- [ ] **Step 2: run, verify fails** — `PYTHONPATH=.:$MEGATRON_PATH python3 tests/test_transfer_chunking.py` → AttributeError (or SKIP on dev).
 
-Run: `PYTHONPATH=.:$MEGATRON_PATH python3 tests/test_transfer_chunking.py`
-Expected: `AttributeError`/`ImportError` (`_chunk_virtual_params` / `_RESHARD_STATE_BYTES_PER_NUMEL`
-not defined) — on the dev box it will instead print `SKIP` (megatron absent); run the real assertion
-on the A100 box.
-
-- [ ] **Step 3: Implement the helpers** (in `TransferManager`; bytes-per-numel is DERIVED, not hardcoded)
+- [ ] **Step 3: implement the helpers** (in `TransferManager`)
 
 ```python
     @staticmethod
     def _virtual_param_global_numel(virtual_param) -> int:
-        """Rank-invariant global element count of a vparam (mirrors
-        virtual_param.py:40-42). Used only to cut chunk boundaries identically on
-        every rank."""
+        """Rank-invariant global element count (mirrors virtual_param.py:40-42).
+        Used only to cut chunk boundaries identically on every rank."""
         return virtual_param.size
 
     def _resolve_state_bytes_per_numel(self, virtual_params) -> int:
-        """Σ(element_size) over a param's optimizer states (master + moments),
-        DERIVED from the actual OptimizerTensorInfo the adapter populated — never
-        hardcoded. Adam-fp32 => 4+4+4 = 12; mixed-precision / non-Adam optimizers
-        come out right automatically (each state carries its own dtype, I-15). Read
+        """Sum(element_size) over a param's optimizer states (master + moments),
+        DERIVED from the actual OptimizerTensorInfo the adapter populated (never
+        hardcoded; Adam-fp32 -> 12, mixed/other optimizers come out right). Read
         from whatever info THIS rank holds, then all-reduce MAX so every rank uses
-        the SAME value (ranks holding no param contribute 0) — required because the
-        chunk budget (numel) derives from it and boundaries must be rank-identical.
-        Runs inside with_world_group(union) like _resolve_staging_cap."""
+        the same value (ranks holding no param contribute 0) — the chunk budget
+        derives from it and boundaries must be rank-identical. Runs inside
+        with_world_group(union) like _resolve_staging_cap."""
         local = 0
         for vp in virtual_params:
             info = vp.src_optimizer_tensor_info or vp.dst_optimizer_tensor_info
             if info is not None:
                 local = sum(t.element_size() for t in info.optimizer_tensors)
                 break
-        t = torch.tensor(
-            [local], device=torch.cuda.current_device(), dtype=torch.int64
-        )
+        t = torch.tensor([local], device=torch.cuda.current_device(), dtype=torch.int64)
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.MAX)
         return max(1, int(t.item()))
 
     def _chunk_virtual_params(self, virtual_params, budget_numel):
-        """Yield consecutive chunks whose combined GLOBAL numel stays under
-        ``budget_numel``. Boundaries depend ONLY on the rank-invariant global vparam
-        sizes, so every rank cuts identically and the per-chunk butterfly p2p stays
-        in lockstep. ``budget_numel`` None => one chunk (today's all-at-once). A
-        single vparam larger than the budget is never split — it forms its own chunk."""
+        """Yield consecutive chunks whose combined global numel stays under
+        ``budget_numel``. Boundaries depend ONLY on rank-invariant vparam sizes.
+        ``budget_numel`` None/<=0 => one chunk. An oversized single vparam forms its
+        own chunk (never split)."""
         if not budget_numel or budget_numel <= 0:
             yield list(virtual_params)
             return
@@ -161,195 +134,64 @@ on the A100 box.
             yield chunk
 ```
 
-The test (Step 1) chunks directly in numel: `tm._chunk_virtual_params(vps, budget_numel=200)` →
-`[[100,100],[100,50]]`; `budget_numel=None`/`0` → one chunk; an oversized vparam forms its own chunk.
-`_resolve_state_bytes_per_numel` needs a live process group, so it is exercised on the box, not in
-the torch-free unit test.
-
-- [ ] **Step 4: Run test, verify it passes** (on the box)
-
-Run: `PYTHONPATH=.:$MEGATRON_PATH python3 tests/test_transfer_chunking.py`
-Expected: `PASS tests/test_transfer_chunking.py`
-
-- [ ] **Step 5: Confirm `virtual_param.size` is the right accessor**
-
-Run: `grep -n "def size" elastic_megatron/resharding/virtual_param.py`
-Expected: a `size` property on `VirtualParam` returning `shape.size`/`shape.numel()`. If it is named
-differently or lives on a sub-attr, update `_virtual_param_global_numel` to the correct
-rank-invariant accessor and re-run Step 4.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add elastic_megatron/transfer/transfer.py tests/test_transfer_chunking.py
-git commit -m "feat(transfer): rank-invariant vparam chunker for flat-peak reshard"
-```
+- [ ] **Step 4: run on box, verify PASS.** **Step 5: confirm `vp.size` accessor** (`grep -n "def size" elastic_megatron/resharding/virtual_param.py`; fix `_virtual_param_global_numel` if it differs). **Step 6: commit** (`feat(transfer): rank-invariant vparam chunker + derived per-numel`).
 
 ---
 
-### Task 2: extract `_transfer_chunk` (pure refactor, behavior identical)
+### Task 2: [INVESTIGATION — dispatched to sub-agent `transfer-order-investigator`] resolve the within-chunk comm-ordering mechanism
 
-**Files:** Modify `elastic_megatron/transfer/transfer.py` (`_main_process` body → `_transfer_chunk`)
+The approach-2 ordering needs `pack-src → release-src → comm → create-dst → unpack`, but the current
+`batched_transfer.transfer` does pack+comm+unpack atomically and needs dst pre-allocated (for the
+unpack views), and interleaves pack/comm/unpack per cap-round. **Open question:** the minimal,
+deadlock-safe way to let `_main_process` interleave release-src (after pack) and create-dst (before
+unpack) per chunk, preserving cap-chunking + future overlap. Candidate mechanisms: (a) callbacks
+(`on_packed=release_src`, `on_pre_unpack=create_dst`) into `transfer()`; (b) split `transfer()` into
+`pack()/exchange()/unpack()` phases; (c) generalize the baseline's separate send/recv phases.
 
-- [ ] **Step 1: Move the current `_main_process` body into `_transfer_chunk`**
-
-Rename the existing `_main_process(self, virtual_params)` body (transfer.py:335-424) to
-`_transfer_chunk(self, virtual_params, timings)`: drop the local `timings = ... ` line (now a
-parameter) and the final rank-0 summary print (moves to the new `_main_process` in Task 3). Keep
-everything else byte-for-byte — the same collect (`create_padded_optimizer_tensor()`+`rebuild()` for
-aligned receivers, `_collect_send`/`_collect_recv`), the single `batched_transfer.transfer(...)`,
-the `recv_copy_back` scatter, and the `src_to_release` / `src_to_release_padded` release. Signature:
-
-```python
-    def _transfer_chunk(self, virtual_params, timings):
-        send_tasks = defaultdict(list); recv_tasks = defaultdict(list)
-        recv_copy_back = []; src_to_release = []; src_to_release_padded = []
-        # ... (unchanged body from current _main_process: Collect / Transfer /
-        #      Copy recv / Release) ...
-```
-
-- [ ] **Step 2: Temporary `_main_process` calls it with one chunk**
-
-```python
-    def _main_process(self, virtual_params):
-        timings = {} if self._log_transfer_timing else None
-        self._transfer_chunk(virtual_params, timings)
-        if timings is not None and self._rank == 0:
-            summary = "  ".join(f"{n}: {ms:.2f}ms" for n, ms in timings.items())
-            print(f"[ElasticMegatron-Transfer] {summary}", flush=True)
-```
-
-- [ ] **Step 3: Verify no behavior change**
-
-Run: `python3 -m py_compile elastic_megatron/transfer/transfer.py && ruff check elastic_megatron/transfer/transfer.py`
-Expected: clean. (Bit-exact equivalence is verified on GPU in Task 5 — this step is a pure
-extraction; one chunk == the old single batched call.)
-
-- [ ] **Step 4: Commit**
-
-```bash
-git add elastic_megatron/transfer/transfer.py
-git commit -m "refactor(transfer): extract _transfer_chunk from _main_process (no behavior change)"
-```
+- [ ] **Step 1:** await the sub-agent's findings (butterfly deadlock-safety, baseline send/recv
+  separation, the per-cap-round vs per-chunk reconciliation, recommended mechanism).
+- [ ] **Step 2:** decide the mechanism WITH the user, then finalize Task 3's exact code.
 
 ---
 
-### Task 3: chunked `_main_process` (the fix)
+### Task 3: [PENDING Task 2] chunked approach-2 `_main_process`
 
-**Files:** Modify `elastic_megatron/transfer/transfer.py` (`_main_process`)
-
-- [ ] **Step 1: Replace `_main_process` with the chunk loop**
+Sketch (exact code after Task 2 picks the mechanism):
 
 ```python
     def _main_process(self, virtual_params):
-        """Transfer the cross-rank reshard plan in rank-invariant chunks, releasing
-        each chunk's src before the next chunk's dst is built, so the resident
-        optimizer-state stays flat (~1x shard) instead of all-dst + all-src (~2x).
-        The chunk budget is the staging cap; budget None/<=0 => one chunk (today's
-        batched behaviour). Coalescing is preserved within each chunk."""
-        timings = {} if self._log_transfer_timing else None
-        cap = self._max_inflight_bytes
-        if cap and cap > 0:
-            budget_numel = max(1, cap // self._resolve_state_bytes_per_numel(virtual_params))
-        else:
-            budget_numel = None  # no cap => one chunk (today's batched behaviour)
+        budget_numel = (max(1, self._max_inflight_bytes // self._resolve_state_bytes_per_numel(virtual_params))
+                        if self._max_inflight_bytes and self._max_inflight_bytes > 0 else None)
         for chunk in self._chunk_virtual_params(virtual_params, budget_numel):
-            self._transfer_chunk(chunk, timings)
-        if timings is not None and self._rank == 0:
-            summary = "  ".join(f"{n}: {ms:.2f}ms" for n, ms in timings.items())
-            print(f"[ElasticMegatron-Transfer] {summary}", flush=True)
+            # approach 2 (mechanism per Task 2):
+            #   pack chunk src -> send staging ; RELEASE chunk src
+            #   exchange (butterfly, cap-chunked staging within)
+            #   CREATE chunk dst (create_padded + rebuild) ; unpack recv staging -> dst
+            ...
 ```
 
-Why this is correct: `_transfer_chunk` releases this chunk's `src_to_release` at its end, BEFORE the
-next iteration builds the next chunk's dst (`create_padded`+`rebuild`). So at any time the resident
-endpoints ≈ (un-processed src) + (already-built dst) ≈ 1× shard, plus one chunk's dst overshoot, plus
-`2×cap` staging. Bit-exactness holds: same per-peer butterfly, same deterministic vparam order, same
-slices and release order — only the batch boundary moves (same argument as the original per-param path).
-
-- [ ] **Step 2: Verify compile/lint**
-
-Run: `python3 -m py_compile elastic_megatron/transfer/transfer.py && ruff check elastic_megatron/transfer/transfer.py`
-Expected: clean.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add elastic_megatron/transfer/transfer.py
-git commit -m "fix(transfer): chunked flat-peak _main_process (release src per chunk before next dst)"
-```
+- chunk_size knob: default = the staging cap-group; leave an interface for multi-cap-group overlap
+  (do NOT hardcode chunk = 2×cap). bit-exact preserved (same bytes/order; only release/create timing
+  + batch boundary move). Subsumes codex's cpu-adam-only `_main_process_streaming`.
 
 ---
 
 ### Task 4: peak-reserved-bytes probe (verification aid)
 
-**Files:** Modify `elastic_megatron/transfer/transfer.py` (`transfer_optimizer_tensors`)
+`ELASTIC_TRANSFER_PEAK_PROBE=1` around the main process logs `torch.cuda.max_memory_reserved()`
+(rank 0) — the signal distinguishing `max(src,dst)+chunk_size` from the 2×shard baseline.
 
-- [ ] **Step 1: Add an opt-in peak probe around the main process**
+### Task 5: GPU verification (the binding gate; A100, off-NFS)
+- bit-exact `verify_all` ALL PASS: **CPU_OFFLOAD=0 (GPU-adam — the regressed path)** + **=1 (cpu-adam)**, pack on/off.
+- peak probe: small chunk (many chunks) peak ≈ `max(src,dst)+chunk_size` ≪ the one-chunk 2× baseline.
 
-```python
-        # ELASTIC_TRANSFER_PEAK_PROBE=1 reports the GPU reserved-bytes high-water of
-        # the main transfer (rank 0) — the signal that distinguishes flat vs 2x peak.
-        _peak_probe = os.getenv("ELASTIC_TRANSFER_PEAK_PROBE", "0") == "1"
-        if _peak_probe:
-            torch.cuda.reset_peak_memory_stats()
-        process_virtual_params(self._pre_process)
-        self._main_process(virtual_param_space.all_virtual_params)
-        if _peak_probe and self._rank == 0:
-            print(f"[ElasticMegatron-Transfer] main-process peak reserved: "
-                  f"{torch.cuda.max_memory_reserved() / (1 << 20):.0f} MiB "
-                  f"(cap={self._max_inflight_bytes})", flush=True)
-        process_virtual_params(self._post_process)
-```
-
-(Replaces the current bare `process_virtual_params(self._pre_process)` / `self._main_process(...)` /
-`process_virtual_params(self._post_process)` at transfer.py:544-546.)
-
-- [ ] **Step 2: compile/lint + commit**
-
-```bash
-python3 -m py_compile elastic_megatron/transfer/transfer.py && ruff check elastic_megatron/transfer/transfer.py
-git add elastic_megatron/transfer/transfer.py
-git commit -m "feat(transfer): opt-in main-process peak-reserved probe"
-```
-
----
-
-### Task 5: GPU verification (bit-exact + flat-peak), via the A100 runner
-
-Not a code step — the binding acceptance gate. Run on the freed A100, ckpts off-NFS (`/tmp`).
-
-- [ ] **Step 1: bit-exact, GPU-adam (the regressed path)** — `CPU_OFFLOAD=0`, pack on AND off:
-  `ELASTIC_SAVE_CKPT=1 TRAIN_ITERS=9 ELASTIC_RESHARD_INTERVAL=1 MODEL_SIZE=tiny NUM_LAYERS=8`
-  `ELASTIC_USE_ASYNCBUFFER_P2P=1` then `=0`, on `dense_mix_full` → `verify_all.py --thresh 1e-3`.
-  Expected: `→ ALL PASS` both. (Chunking must not change which bytes land.)
-- [ ] **Step 2: bit-exact, cpu-adam** — `CPU_OFFLOAD=1` on `moe_mix_full`, same as above → `ALL PASS`.
-- [ ] **Step 3: flat-peak demonstration** — `ELASTIC_TRANSFER_PEAK_PROBE=1` with a model whose dst
-  optimizer state ≫ cap, on `dense_mix_full` `CPU_OFFLOAD=0`: compare the printed main-process peak
-  reserved for a tiny cap (`ELASTIC_MAX_INFLIGHT_BYTES=536870912`, 512 MiB → many chunks → flat) vs a
-  huge cap (`ELASTIC_MAX_INFLIGHT_BYTES=0`, one chunk → 2× baseline). Expect the small-cap peak to be
-  ≈ 1× the per-rank optimizer shard + ~1.5 GiB, well below the one-chunk 2× peak.
-
----
+## Open / deferred
+- **The within-chunk comm mechanism** (Task 2, sub-agent investigating; discuss with user after).
+- chunk_size default + knob naming (after Task 2).
+- Fold codex's `feat/hostmem-30b-hang` streaming onto this path once verified (follow-up).
 
 ## Self-review
-
-- **Spec coverage:** restores flat peak for GPU-adam (Tasks 2-3) ✔; budget = free-mode cap (Task 3,
-  `self._max_inflight_bytes`) ✔; small cap → per-param (Task 1 budget_numel→1 chunks of 1) ✔;
-  coalescing preserved within a chunk (Task 2 keeps the single batched call per chunk) ✔; bit-exact
-  (Tasks 2/5) ✔; rank-invariant boundaries (Task 1 + its test) ✔.
-- **Placeholder scan:** the one open item is the exact `vp.size` accessor — guarded by Task 1 Step 5
-  + the unit test, not left as a TODO in shipped code.
-- **Type consistency:** `_chunk_virtual_params` yields `list[VirtualParam]`; `_transfer_chunk` takes
-  `(list[VirtualParam], timings|None)`; `_main_process` passes `self._max_inflight_bytes` (already an
-  `int|None`). Consistent.
-
-## Open questions for the reviewer (you)
-
-1. **Budget = cap exactly** gives peak ≈ `shard + cap + 2×cap` = `shard + 3×cap` (you chose this).
-   Confirm you don't want the tighter `shard + 2×cap` (would split the cap between chunk-dst and
-   staging — one extra line in `_main_process`). Current plan = `shard + 3×cap`.
-2. **RESOLVED — derive, don't hardcode.** `_resolve_state_bytes_per_numel` reads Σ(element_size)
-   from the actual `OptimizerTensorInfo` states (master + moments) and all-reduces MAX for
-   rank-identical budget boundaries. Adam-fp32 → 12 automatically; no constant.
-3. Once verified, this **supersedes codex's `_main_process_streaming`** on `feat/hostmem-30b-hang`
-   (its cpu-adam-only chunk=1). Fold that branch onto this path in a follow-up, or keep separate?
+- Spec coverage: flat peak GPU+cpu-adam (Tasks 3) ✔; rank-invariant cuts (Task 1 + test) ✔; derived
+  per-numel (Task 1) ✔; chunk≠cap knob (architecture + Task 3) ✔; bit-exact + GPU gate (Task 5) ✔.
+- The comm mechanism is correctly deferred to Task 2 rather than pre-specified (it was the source of
+  the earlier muddled design); Task 1 is mechanism-independent and can land now.
