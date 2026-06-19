@@ -78,15 +78,25 @@ branches/worktrees:
 > A 4th worktree `../em-buffer-opt` (`fix/transfer-staging-residency`) is a **separate / parked**
 > staging-residency experiment — **not part of this flat-peak work**.
 
-**Immediate next step: the flat-peak fix is DONE** — implemented (`8a128e5`/`286d709`/`647b693`),
-adversarially reviewed (0 confirmed bugs; the cpu-adam pinned-src hazard the review surfaced is fixed
-by `647b693`), and **A100 bit-exact verified** (2026-06-19: 8/8 weight + 8/8 optim ALL PASS across
-CPU_OFFLOAD=0 GPU-adam AND =1 cpu-adam × pack on/off, flat peak 428–516 MiB vs 8192 MiB cap, no OOM).
-Remaining follow-ups (none blocking the fix): (1) open a PR for `fix/transfer-flat-peak`; (2) fold
-codex's cpu-adam-only `_main_process_streaming` (`feat/hostmem-30b-hang`) onto this unified chunked
-path — the flat-peak path subsumes it; (3) reconcile the 3-branch entanglement
-(`feat/cpu-adam-transfer-opt` holds uncommitted docs). The durable findings (codex review verdict, the
-flat-peak regression + Task 3 landing + verify, the intermittent 30B hang) live in cross-session memory.
+**Immediate next step: performance tuning of the reshard transfer.** The flat-peak fix AND the
+host-memory fix are DONE + A100-verified on `fix/transfer-flat-peak`:
+- Flat-peak (`8a128e5`/`286d709`/`647b693`): chunked approach-2, reviewed, bit-exact 8/8+8/8 ALL PASS
+  (GPU-adam AND cpu-adam × pack on/off), flat peak 428–516 MiB, no OOM.
+- Host-memory fold (`b2c31ed`/`166f3e9`/`aacc25c`): codex's POOL B pinned-grad release + 30B
+  stabilization + Adam step repair folded in; codex's cpu-adam-only `_main_process_streaming`
+  **subsumed** by the chunked path (dropped), its `empty_host_cache` reclaim **integrated** into
+  `_main_process_chunk`. **30B cpu-adam host-mem PARITY verified (2026-06-19):** baseline W8 1006 GB =
+  elastic pre-reshard W8 1006 GB (zero infra overhead); settled after W8→W4 reshard ~843 GB ≤ baseline
+  (no leftover). Bit-exact regression re-passed.
+- **Perf target:** the 30B cpu-adam reshard moved 45.35 GB in 44.2 s (**1.03 GB/s**, D2H/H2D-bound).
+  Precedent to fold/adapt: the cpu-adam single-sided H2D-prefetch overlap (+14.3% on 30B, default OFF)
+  on `feat/cpu-adam-transfer-opt` (`cpu-adam-overlap.md`, `b2f423f`), plus the multi-cap-per-chunk
+  overlap seam left open in the flat-peak chunked design.
+- Pre-existing, report-only (NOT this work): baseline `ELASTIC_ENABLED=0` PG-timeout assert in
+  `update_pg_timeout_after_init` (only unwraps ElasticProcessGroup on the =1 branch); too-short 30B
+  dev timeouts. The moe_30b asymmetric-world hang is a separate open issue (did not fire this run).
+- Open follow-ups: a PR for `fix/transfer-flat-peak`; reconcile `feat/cpu-adam-transfer-opt`'s
+  uncommitted docs. Durable findings live in cross-session memory.
 
 ## If you are a new agent picking up this repo
 
