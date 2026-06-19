@@ -30,12 +30,15 @@ export PYTHONPATH=${PYTHONPATH:-${_SCRIPT_DIR}:${MEGATRON_PATH}}
 export ELASTIC_ENABLED=${ELASTIC_ENABLED:-0}
 
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-# Keep post-init hang detection short for reduced-model runs. The
-# Megatron init timeout is still controlled separately by integer minutes.
+# Post-init hang detection. NOTE: this is the *30B* launcher — a cpu-adam 30B
+# iteration is ~70-160 s and a reshard transfer is tens of seconds, so the
+# repo-wide ~30 s dev default (which surfaces hangs fast on tiny smoke tests)
+# produces FALSE timeouts here. Default to values that clear a real 30B step
+# (override down for fast hang-surfacing on a reduced model).
 export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-1}
-export NCCL_TIMEOUT=${NCCL_TIMEOUT:-30}
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-30}
-TIMEOUT_AFTER_INIT_SEC=${TIMEOUT_AFTER_INIT_SEC:-30}
+export NCCL_TIMEOUT=${NCCL_TIMEOUT:-600}
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-600}
+TIMEOUT_AFTER_INIT_SEC=${TIMEOUT_AFTER_INIT_SEC:-600}
 
 # cpu-adam (HybridDeviceOptimizer) is CPU-thread bound; 14 threads matches the
 # slime 30B config (too few -> ~80x slower / host OOM).
@@ -151,7 +154,7 @@ TRAINING_ARGS=(
     --bf16
     --accumulate-allreduce-grads-in-fp32
     --calculate-per-token-loss
-    --distributed-timeout-minutes ${TIMEOUT_MIN:-10}
+    --distributed-timeout-minutes ${TIMEOUT_MIN:-20}
     --seed 1234
 )
 
