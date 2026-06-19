@@ -88,7 +88,7 @@ reshard's union group is a strict subset of the world, `rank_name_to_time[global
 goes out of bounds → `IndexError` / misreport. Replaced with a `with self._timed(...)`
 context manager backed by the existing CUDA-synced `resharding.util.Timer`; per-phase
 durations accumulate locally and print on rank 0 — **no cross-rank collective**.
-`ELASTIC_TRANSFER_LOG_LEVEL=0` disables it at zero cost.
+`ELASTIC_TRANSFER_LOG_LEVEL=1` enables it; the default is zero-overhead quiet mode.
 
 ### 3.3 CPU-adam device staging (key insight, commit `f4e2f38`)
 
@@ -147,7 +147,7 @@ way to `_pack_chunk`/`_unpack_chunk`/`_enqueue_unpacked` + `chunk_schedule`.
 | `ELASTIC_USE_ASYNCBUFFER_P2P` | `1` | `1` = packed fast path (per-peer slices coalesced into reused staging buffers, byte-chunked); `0` = one staged p2p op per slice (legacy fallback; `ELASTIC_MAX_INFLIGHT_BYTES` ignored). |
 | `ELASTIC_STAGING_CAP_MODE` | `free` | Per-chunk staging cap source: `free` = clamp((min current free GPU mem across union ranks − 2 GiB reserve) // 2, 512 MiB, 8 GiB) via one MIN all-reduce (the 2 GiB reserve keeps 2× cap from filling the card; reflects real device memory, incl. co-tenant processes); `fixed` = 2 GiB constant. |
 | `ELASTIC_MAX_INFLIGHT_BYTES` | unset | Overrides the mode: positive = exact per-chunk cap; `<=0` = one chunk per peer (legacy residency). **Must be identical on every rank** (both ends derive chunk counts from it). |
-| `ELASTIC_TRANSFER_LOG_LEVEL` | `1` | `0` disables per-phase transfer timing (zero overhead); otherwise rank 0 prints per-phase ms. |
+| `ELASTIC_TRANSFER_LOG_LEVEL` | `0` | `1` enables per-phase transfer timing and rank-0 transfer summaries; default quiet mode has zero timing overhead. |
 
 ## 4. Verification
 

@@ -32,7 +32,15 @@ from weakref import WeakKeyDictionary
 import torch
 from megatron.core.optimizer import DistributedOptimizer, MegatronOptimizer
 
+from ..host_memory import empty_host_cache, trim_host_memory
 from .util import ParamRange, Range
+
+
+def _optimizer_param_generator(torch_optimizer):
+    for group in torch_optimizer.param_groups:
+        for param in group["params"]:
+            yield param
+
 
 # Canonical ordering of per-param optimizer-state keys. The SRC side discovers
 # states from an already-initialized optimizer.state dict; the DST side allocates
@@ -347,13 +355,10 @@ class HybridDeviceOptimizerAdapter(PrecisionAwareOptimizerAdapter):
     """HybridDeviceOptimizer (CPU+GPU offload), wrapped by a precision-aware DO.
 
     Its ``.state`` is a view synced from device-specific sub-optimizers and
-    ``init_state_fn`` is None, so empty placeholders would not connect to the real
-    sub-optimizer tensors. ``dummy_step()`` allocates the real state on each
-    sub-optimizer's own device (CPU for offloaded params, GPU otherwise) and syncs it
-    into ``.state``. On the dst this is safe: both the state values and the dummy-grad
-    param perturbation are overwritten by the reshard transfer. The CPU-resident
-    moments then ride the device-aware transport in communicator.py. We offload only
-    the master here; the moments stay allocated and are received in place.
+    ``init_state_fn`` is None. Non-offload setup still delegates to HDO's
+    ``dummy_step()``. For offload reshard dst setup we create the expected Adam
+    state schema with storage-0 placeholders, then transfer rebuilds and fills the
+    param-shaped master/moments one virtual param at a time.
     NOTE: meta-device HDO build is not handled (dummy_step needs real storage).
     """
 
@@ -363,11 +368,80 @@ class HybridDeviceOptimizerAdapter(PrecisionAwareOptimizerAdapter):
         main_weight: torch.Tensor,
         offload: bool,
     ) -> None:
-        if len(self.optimizer.optimizer.state[main_weight]) != 0:
+        if len(self.optimizer.optimizer.state[main_weight]) == 0:
+            if offload:
+                self._init_empty_hdo_state()
+                self._release_all_param_shaped_states()
+                return
+            self.optimizer.optimizer.dummy_step()
             return
-        self.optimizer.optimizer.dummy_step()
         if offload:
-            main_weight.storage().resize_(0)
+            self._release_param_shaped_states(model_weight)
+
+    def _empty_like_storage_zero(self, tensor: torch.Tensor) -> torch.Tensor:
+        placeholder = torch.empty_like(
+            tensor, memory_format=torch.preserve_format
+        )
+        placeholder.storage().resize_(0)
+        return placeholder
+
+    def _init_empty_hdo_state(self) -> None:
+        """Initialize HDO Adam state as storage-0 placeholders on dst.
+
+        ``dummy_step`` initializes HDO correctly, but it also allocates every
+        dst master/moment tensor before transfer. For reshard dst setup we only
+        need state-dict entries with the right schema; transfer rebuilds and
+        fills the param-shaped tensors later.
+        """
+        hdo = self.optimizer.optimizer
+        for sub_optimizer in hdo.sub_optimizers:
+            for param in _optimizer_param_generator(sub_optimizer):
+                state = sub_optimizer.state[param]
+                if state:
+                    continue
+                state["step"] = torch.zeros(
+                    (),
+                    dtype=torch.float32,
+                    device=param.device,
+                )
+                for key in _ADAM_STATE_KEYS:
+                    state[key] = self._empty_like_storage_zero(param)
+        hdo._sync_sub_optimizers_state_to_hdo()
+
+    def _release_param_shaped_states(
+        self, model_weight: torch.nn.Parameter, flush_host_cache: bool = True
+    ) -> bool:
+        """Resize this param's HDO master/moments to storage-0 placeholders."""
+        tensors = self.optimizer._get_main_param_and_optimizer_states(model_weight)
+        anchor = tensors.get("param")
+        if not torch.is_tensor(anchor):
+            return False
+        anchor_numel = anchor.numel()
+        released_host = False
+        for key, tensor in tensors.items():
+            if not torch.is_tensor(tensor):
+                continue
+            if key == "step" or tensor.numel() != anchor_numel:
+                continue
+            if tensor.device.type == "cpu":
+                released_host = True
+            tensor.storage().resize_(0)
+        if released_host and flush_host_cache:
+            empty_host_cache()
+        return released_host
+
+    def _release_all_param_shaped_states(self) -> None:
+        """Undo HDO dummy_step's eager all-param CPU state allocation on dst."""
+        released_host = False
+        for model_weight in self.optimizer.model_param_group_index_map:
+            released_host = (
+                self._release_param_shaped_states(
+                    model_weight, flush_host_cache=False
+                )
+                or released_host
+            )
+        if released_host:
+            trim_host_memory()
 
     def release_offload_host_buffers(self) -> None:
         """Free the HDO's pinned CPU grad buffers (``cpu_copy_map_grad``).
@@ -386,6 +460,7 @@ class HybridDeviceOptimizerAdapter(PrecisionAwareOptimizerAdapter):
         ``_set_sub_optimizer_grads``), so reshard-back is unaffected: POOL A is
         refilled by rebuild()+transfer, POOL B by that lazy step path.
         """
+        self._release_all_param_shaped_states()
         hdo = self.optimizer.optimizer
         for param, grad in hdo.cpu_copy_map_grad.items():
             # The owning sub-optimizer param holds .grad referencing this buffer; drop
@@ -399,3 +474,4 @@ class HybridDeviceOptimizerAdapter(PrecisionAwareOptimizerAdapter):
         # Clear the map so the HDO's lazy path re-creates fresh pinned buffers on the
         # gear's next step (it keys on `param not in self.cpu_copy_map_grad`).
         hdo.cpu_copy_map_grad.clear()
+        trim_host_memory()

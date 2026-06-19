@@ -11,11 +11,12 @@ MEGATRON_PATH=${MEGATRON_PATH:?'MEGATRON_PATH is not set. Set it to your Megatro
 _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export PYTHONPATH=${PYTHONPATH:-${_SCRIPT_DIR}:${MEGATRON_PATH}}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-# Short NCCL timeout (60s) so hangs surface quickly during debugging.
+# Short NCCL timeout so hangs surface quickly.
 # Bump this for long real runs.
 export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-1}
-export NCCL_TIMEOUT=${NCCL_TIMEOUT:-60}
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-60}
+export NCCL_TIMEOUT=${NCCL_TIMEOUT:-30}
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-30}
+TIMEOUT_AFTER_INIT_SEC=${TIMEOUT_AFTER_INIT_SEC:-30}
 
 export OMP_NUM_THREADS=8
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -113,6 +114,10 @@ TRAINING_ARGS=(
     --seed 1234
 )
 
+TRAINING_ARGS+=(
+    --distributed-timeout-seconds-after-init ${TIMEOUT_AFTER_INIT_SEC}
+)
+
 # CPU_OFFLOAD=1 builds Megatron's HybridDeviceOptimizer (CPU+GPU mixed optimizer
 # state); requires the precision-aware optimizer code path. OFFLOAD_FRACTION is the
 # fraction of GPU optimizer-state numel pushed to CPU. Default unset → plain GPU Adam.
@@ -137,7 +142,7 @@ MODEL_PARALLEL_ARGS=(
 RECOMPUTE_ARGS=()
 
 LOGGING_ARGS=(
-    --log-interval 1
+    --log-interval ${LOG_INTERVAL:-1}
     --eval-interval ${EVAL_INTERVAL:-1000}
     --eval-iters ${EVAL_ITERS:-0}
     --no-load-optim

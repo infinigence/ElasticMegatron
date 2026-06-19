@@ -16,6 +16,7 @@ from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args, get_timers
 from megatron.training.training import preprocess_common_state_dict
 
+from ..host_memory import empty_host_cache, trim_host_memory
 from ..resharding.optimizer_adapter import OptimizerAdapter
 from ..resharding.resharding_metadata import (
     OptimizerTensorInfo,
@@ -89,6 +90,7 @@ class TrainingState:
             model, optimizer, opt_param_scheduler = cls.setup_model_and_optimizer_func(
                 *args, **kwargs
             )
+        empty_host_cache()
         return cls(model, optimizer, opt_param_scheduler)
 
     def __init__(
@@ -369,6 +371,7 @@ class TrainingState:
         if os.environ.get("ELASTIC_RELEASE_HDO_HOST_BUFFERS", "1") == "1":
             for optimizer in self.optimizers:
                 OptimizerAdapter.create(optimizer).release_offload_host_buffers()
+        trim_host_memory()
 
     def rebuild_optimizer(self):
         for optimizer_tensor_info in self.optimizer_tensor_info_list:

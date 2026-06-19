@@ -9,6 +9,7 @@ from megatron.core import parallel_state
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 
+from ..host_memory import empty_host_cache
 from ..megatron_manager.parallel_strategy import ParallelStrategy
 from ..megatron_manager.training_state import (
     TrainingState,
@@ -36,7 +37,7 @@ class TransferManager:
         # When enabled, each phase of the batched transfer is timed (CUDA-
         # synchronized) and the per-phase durations are printed on rank 0.
         # Disabled => the timing context managers are no-ops (zero overhead).
-        self._log_transfer_timing = os.getenv("ELASTIC_TRANSFER_LOG_LEVEL", "1") != "0"
+        self._log_transfer_timing = os.getenv("ELASTIC_TRANSFER_LOG_LEVEL", "0") != "0"
         # Pack each peer's slices into one buffer before NCCL (fast path) vs one
         # p2p op per slice. The packed buffer lives on GPU, so packing doubles as
         # CPU<->GPU staging for offloaded (HybridDeviceOptimizer) state.
@@ -63,6 +64,11 @@ class TransferManager:
         # (rank 0). The flat-peak fix should show a peak of ~max(src,dst)+chunk_size
         # that does NOT scale with the number of chunks, vs the 2x-shard baseline.
         self._peak_probe = os.getenv("ELASTIC_TRANSFER_PEAK_PROBE", "0") == "1"
+        # Accumulates freed offloaded (host) src bytes across a reshard's chunks;
+        # the chunked main process returns them to the OS once past a threshold so
+        # cpu-adam host RSS tracks max(host_src,host_dst)+chunk and matches a
+        # non-elastic run afterwards. Reset per reshard in _main_process.
+        self._host_bytes_since_flush = 0
 
     def _resolve_staging_cap(self) -> int | None:
         """Per-chunk staging byte cap for this reshard, identical on every rank.
@@ -129,7 +135,10 @@ class TransferManager:
         self.batched_transfer.transfer(
             send_tasks, {}, pack=self._pack, max_inflight_bytes=self._max_inflight_bytes
         )
+        released_host_bytes = self._host_storage_nbytes(src_optimizer_tensor_info)
         src_optimizer_tensor_info.release()
+        if released_host_bytes:
+            empty_host_cache()
 
     def _recv_optimizer_tensors(
         self,
@@ -396,6 +405,23 @@ class TransferManager:
         if chunk:
             yield chunk
 
+    @staticmethod
+    def _host_storage_nbytes(optimizer_tensor_info: OptimizerTensorInfo | None) -> int:
+        """Live host (CPU/offloaded) storage bytes of a param's optimizer state.
+        Used to (a) gate the pre-release barrier and host-cache reclaim to the
+        cpu-adam path and (b) size that reclaim. 0 for GPU-resident state."""
+        if optimizer_tensor_info is None:
+            return 0
+        total = 0
+        for tensor in optimizer_tensor_info.optimizer_tensors:
+            if tensor.device.type != "cpu":
+                continue
+            try:
+                total += tensor.untyped_storage().nbytes()
+            except RuntimeError:
+                pass
+        return total
+
     def _main_process(self, virtual_params: List[VirtualParam]):
         """Execute the cross-rank transfer plan for every param at a FLAT memory
         peak (``max(src_all, dst_all) + chunk_size``).
@@ -442,10 +468,17 @@ class TransferManager:
         self.batched_transfer.last_phase_ms = (
             {"pack": 0.0, "comm": 0.0, "unpack": 0.0} if timings is not None else None
         )
+        self._host_bytes_since_flush = 0
 
         with self._timed(timings, "Transfer"):
             for chunk in self._chunk_virtual_params(virtual_params, budget_numel):
                 self._main_process_chunk(chunk)
+        # Final host-cache flush: return any sub-threshold remainder of freed
+        # offloaded src to the OS so the post-reshard host RSS matches a
+        # non-elastic run (no-op when nothing host-resident was released).
+        if self._host_bytes_since_flush:
+            empty_host_cache()
+            self._host_bytes_since_flush = 0
 
         if timings is not None and self.batched_transfer.last_phase_ms:
             for phase, ms in self.batched_transfer.last_phase_ms.items():
@@ -492,6 +525,9 @@ class TransferManager:
         # now staged) BEFORE the comm: this is what keeps src and dst from
         # coexisting (approach 2). The self-edge clones already hold their bytes.
         staged = self.batched_transfer.pack(send_tasks)
+        released_host_bytes = sum(
+            self._host_storage_nbytes(src_info) for src_info in src_to_release
+        )
         # pack's stage-in of a HOST-resident (CPU-offloaded) src is an H2D copy
         # that is async w.r.t. the host when the src is pinned; release() below
         # frees that host storage on the host thread, so without a barrier it can
@@ -499,16 +535,22 @@ class TransferManager:
         # released only AFTER the NCCL wait() (an implicit host sync); restore
         # that guarantee here -- explicitly, NOT via the profiling-only _phase()
         # synchronize (which disappears at ELASTIC_TRANSFER_LOG_LEVEL=0). A
-        # GPU-resident src needs no barrier: its copy and the later same-stream
-        # reuse are stream-ordered (I-16), so the GPU-adam path pays nothing.
-        if any(
-            tensor.device.type != "cuda"
-            for src_info in src_to_release
-            for tensor in src_info.optimizer_tensors
-        ):
+        # GPU-resident src (released_host_bytes == 0) needs no barrier: its copy
+        # and the later same-stream reuse are stream-ordered (I-16), so the
+        # GPU-adam path pays nothing.
+        if released_host_bytes:
             torch.cuda.current_stream().synchronize()
         for src_info in src_to_release:
             src_info.release()
+        # Return the freed offloaded (pinned host) src blocks to the OS once the
+        # accumulated amount crosses ~1 GiB, so cpu-adam host RSS tracks
+        # max(host_src,host_dst)+chunk during the reshard rather than holding the
+        # old strategy's host state in the allocator cache (the host-memory-parity
+        # bar). empty_host_cache has real cost, so it is batched, not per-chunk.
+        self._host_bytes_since_flush += released_host_bytes
+        if self._host_bytes_since_flush >= (1 << 30):
+            empty_host_cache()
+            self._host_bytes_since_flush = 0
 
         # Phase 4 -- butterfly exchange over staging only (src freed, dst absent).
         received = self.batched_transfer.exchange(staged, recv_nbytes)
@@ -719,7 +761,7 @@ class TransferManager:
         # exchange (after release_model + cache reclaim, inside the union world
         # group). Identical on every rank.
         self._max_inflight_bytes = self._resolve_staging_cap()
-        if self._pack and self._rank == 0:
+        if self._pack and self._log_transfer_timing and self._rank == 0:
             cap = self._max_inflight_bytes
             shown = "no-split" if not cap or cap <= 0 else f"{cap / (1 << 20):.0f} MiB"
             print(

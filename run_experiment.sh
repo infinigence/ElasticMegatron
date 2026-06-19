@@ -20,6 +20,8 @@
 #   dense_cp_only        —— 仅 CP/Group-Zero 维度 sweep,隔离用
 #   moe_mix_full         —— MoE 8-策略 sweep,含 EP/PP/CP
 #   moe_cp_only          —— EP=2 固定,仅 CP/Group-Zero 维度 sweep,隔离用
+#   dense_scale_world    —— Dense world 8↔4 scale-down/up,走 run_e2e_demo.sh
+#   moe_scale_world      —— MoE world 8↔4 scale-down/up,走 run_moe.sh
 #
 # 关键环境变量:
 #   GPUS_PER_NODE        —— 每节点 GPU 数,默认 4
@@ -175,6 +177,26 @@ case "${EXP_NAME}" in
         export ELASTIC_STRATEGY_MODE=moe_cp_only
         export TP=1 PP=1 EP=2 CP=1 NUM_DIST_OPT=1
         export NUM_EXPERTS=8
+        export NUM_LAYERS=${NUM_LAYERS_MOE:-4}
+        export FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-4096}
+        bash "$(dirname "$0")/run_moe.sh"
+        ;;
+    dense_scale_world)
+        # Explicit asymmetric-world dense test: base world=8, target world=4,
+        # then the interval cycle grows back to world=8. Keeps TP/PP/CP fixed.
+        export ELASTIC_ENABLED=1
+        export ELASTIC_STRATEGY_MODE=dense_scale_world
+        export TP=${TP:-1} PP=${PP:-1} CP=${CP:-1} NUM_DIST_OPT=1
+        bash "$(dirname "$0")/run_e2e_demo.sh"
+        ;;
+    moe_scale_world)
+        # Explicit asymmetric-world MoE test: base world=8, target world=4,
+        # preserving TP/PP/CP/EP/TPE. Small-model analogue of the 30B DP2<->DP1
+        # shrink/grow path.
+        export ELASTIC_ENABLED=1
+        export ELASTIC_STRATEGY_MODE=moe_scale_world
+        export TP=${TP:-1} PP=${PP:-1} EP=${EP:-2} CP=${CP:-1} NUM_DIST_OPT=1
+        export NUM_EXPERTS=${NUM_EXPERTS:-8}
         export NUM_LAYERS=${NUM_LAYERS_MOE:-4}
         export FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-4096}
         bash "$(dirname "$0")/run_moe.sh"

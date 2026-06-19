@@ -183,7 +183,6 @@ class MegatronStateManager:
         dst_megatron_state: MegatronState = self._parallel_strategy_to_megatron_state[
             str(new_parallel_strategy)
         ]
-        self.apply(parallel_strategy=new_parallel_strategy)
 
         # Get union world group and ranks
         union_world_group, union_world_ranks = get_union_world_group(
@@ -191,6 +190,7 @@ class MegatronStateManager:
         )
         rank = torch.distributed.get_rank()
         if rank not in union_world_ranks:
+            self.apply(parallel_strategy=new_parallel_strategy)
             assert src_megatron_state.training_state is None, (
                 "Training state should be None for node not in union world group"
             )
@@ -204,6 +204,13 @@ class MegatronStateManager:
             src_megatron_state.training_state.release_model()
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+
+        # Switch to the destination mpu/world group only after all source-state
+        # release work is done. Megatron 0.16 can still have source-group CUDA
+        # work outstanding here; applying the dst group first lets early inactive
+        # ranks consume dst/union NCCL collectives while active ranks are still
+        # synchronizing source work.
+        self.apply(parallel_strategy=new_parallel_strategy)
 
         # Setup dst training state
         if (
