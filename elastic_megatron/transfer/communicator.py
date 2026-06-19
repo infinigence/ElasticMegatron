@@ -1,3 +1,4 @@
+import os
 import queue
 import time
 from collections import defaultdict
@@ -294,6 +295,15 @@ class BatchedTransfer:
         # pack (H2D stage-in), comm (NCCL), unpack (D2H stage-out). Input data
         # for the next-phase overlap design (docs/buffer_opt/cpu-adam-overlap.md).
         self.last_phase_ms: dict[str, float] | None = None
+        # cpu-adam D2H (unpack stage-out) is the reshard bottleneck (~2.9 GB/s):
+        # HDO rebinds the fp32 master to PAGEABLE host memory, so GPU->pageable
+        # is effectively synchronous. Routing the bulk D2H through a reused PINNED
+        # host bounce (~25 GB/s) + a CPU scatter into the pageable dst recovers
+        # most of that. Local-only (same bytes/NCCL ops; no cross-rank match
+        # needed), no-op for GPU-adam / already-pinned dst. Default OFF until the
+        # 30B A/B confirms; see docs/buffer_opt/cpu-adam-overlap.md.
+        self._pinned_bounce = os.getenv("ELASTIC_TRANSFER_PINNED_BOUNCE", "0") == "1"
+        self._bounce_buf: torch.Tensor | None = None
 
     def transfer(
         self,
@@ -572,7 +582,40 @@ class BatchedTransfer:
                 "with the dst layout (see _chunk_recv_nbytes)."
             )
             with self._phase("unpack"):
-                self._unpack_chunk(recv_bytes, sizes, (0, total), r_stage)
+                if self._needs_bounce(slices):
+                    # Bulk D2H GPU->PINNED (one fast ~25 GB/s copy; synchronous so
+                    # the bounce is filled before the CPU scatter reads it), then
+                    # scatter PINNED->pageable dst slices (host memcpy). Replaces
+                    # the per-slice GPU->pageable D2H (~2.9 GB/s) that dominated
+                    # the cpu-adam reshard. Same bytes -> bit-exact.
+                    bounce = self._pinned_bounce_buf(total)
+                    bounce.copy_(r_stage)
+                    self._unpack_chunk(recv_bytes, sizes, (0, total), bounce)
+                else:
+                    self._unpack_chunk(recv_bytes, sizes, (0, total), r_stage)
+
+    def _needs_bounce(self, slices: List[torch.Tensor]) -> bool:
+        """True when the pinned-bounce D2H path applies: enabled, and the landing
+        slices are PAGEABLE host (cpu-adam offloaded state). GPU dst (GPU-adam)
+        and already-pinned host dst both skip it -- their direct copy is already
+        fast. Representative device probe on the first slice (a peer's slices all
+        belong to one optimizer state, so share a device/pinning)."""
+        if not self._pinned_bounce or not slices:
+            return False
+        first = slices[0]
+        return first.device.type == "cpu" and not first.is_pinned()
+
+    def _pinned_bounce_buf(self, nbytes: int) -> torch.Tensor:
+        """A single reused PINNED host uint8 bounce buffer, grown to the largest
+        chunk seen (pinned allocation is costly, so reuse). Sliced to ``nbytes``.
+        Reuse is safe because the D2H into it is synchronous and the CPU scatter
+        out of it completes before the next peer/chunk repacks it."""
+        buf = self._bounce_buf
+        if buf is None or buf.numel() < nbytes:
+            self._bounce_buf = buf = torch.empty(
+                nbytes, dtype=torch.uint8, pin_memory=True
+            )
+        return buf[:nbytes]
 
     def _enqueue_unpacked(
         self,
