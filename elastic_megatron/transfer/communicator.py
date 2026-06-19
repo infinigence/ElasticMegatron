@@ -304,6 +304,13 @@ class BatchedTransfer:
         # 30B A/B confirms; see docs/buffer_opt/cpu-adam-overlap.md.
         self._pinned_bounce = os.getenv("ELASTIC_TRANSFER_PINNED_BOUNCE", "0") == "1"
         self._bounce_buf: torch.Tensor | None = None
+        # Cap the PINNED bounce buffer: the D2H is looped through it in <=cap-byte
+        # sub-chunks, so the page-locked footprint stays small REGARDLESS of the
+        # (large) chunk size. A multi-GB pinned alloc is a slow, synchronizing
+        # cudaHostAlloc and competes with NCCL's own pinned transport pool;
+        # bounding it keeps the pinned-bounce D2H win without that contention.
+        # <=0 => unbounded (one buffer the full chunk size; for A/B).
+        self._bounce_cap = int(os.getenv("ELASTIC_TRANSFER_PINNED_BOUNCE_BYTES", str(256 << 20)))
 
     def transfer(
         self,
@@ -583,14 +590,22 @@ class BatchedTransfer:
             )
             with self._phase("unpack"):
                 if self._needs_bounce(slices):
-                    # Bulk D2H GPU->PINNED (one fast ~25 GB/s copy; synchronous so
-                    # the bounce is filled before the CPU scatter reads it), then
-                    # scatter PINNED->pageable dst slices (host memcpy). Replaces
-                    # the per-slice GPU->pageable D2H (~2.9 GB/s) that dominated
-                    # the cpu-adam reshard. Same bytes -> bit-exact.
-                    bounce = self._pinned_bounce_buf(total)
-                    bounce.copy_(r_stage)
-                    self._unpack_chunk(recv_bytes, sizes, (0, total), bounce)
+                    # D2H GPU->PINNED (fast ~25 GB/s; synchronous so the bounce is
+                    # filled before the CPU scatter reads it), then scatter
+                    # PINNED->pageable dst slices (host memcpy). Replaces the
+                    # per-slice GPU->pageable D2H (~2.9 GB/s) that dominated the
+                    # cpu-adam reshard. Looped in <=_bounce_cap sub-chunks so the
+                    # page-locked buffer stays small. Same bytes -> bit-exact.
+                    cap = self._bounce_cap
+                    step = min(cap, total) if cap and cap > 0 else total
+                    bounce = self._pinned_bounce_buf(step)
+                    off = 0
+                    while off < total:
+                        n = min(step, total - off)
+                        sub = bounce[:n]
+                        sub.copy_(r_stage[off : off + n])
+                        self._unpack_chunk(recv_bytes, sizes, (off, off + n), sub)
+                        off += n
                 else:
                     self._unpack_chunk(recv_bytes, sizes, (0, total), r_stage)
 
