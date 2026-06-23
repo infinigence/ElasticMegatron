@@ -11,6 +11,7 @@ from ..megatron_manager.training_state import (
     load_state_dict_with_no_step,
     update_optimizer_by_state_dict,
 )
+from ..resharding.optimizer_adapter import OptimizerAdapter
 from ..resharding.resharding import ReshardPlan
 from ..resharding.resharding_metadata import OptimizerTensorInfo
 from ..resharding.resharding_pp import LayerType, ParamPositionAttr
@@ -408,6 +409,11 @@ class TransferManager:
     ):
         for optimizer in optimizers:
             self._transfer_optimizer_state_dict(optimizer)
+            # The reshard cannot carry the per-param Adam step (dropped as
+            # non-param-shaped, I-15); restore it from the param_groups step just
+            # broadcast above, for optimizers that keep step per-param (CPU-offload
+            # HDO). No-op for every other optimizer. Runs on each dst-active rank.
+            OptimizerAdapter.create(optimizer).repair_per_param_step()
         self._transfer_param_scheduler(opt_param_scheduler)
 
     def _transfer_optimizer_state_dict(
