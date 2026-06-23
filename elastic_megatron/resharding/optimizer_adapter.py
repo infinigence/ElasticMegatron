@@ -267,6 +267,15 @@ class OptimizerAdapter:
         """
         return
 
+    def release_offload_host_buffers(self) -> None:
+        """Free per-optimizer host-side offload buffers not covered by the
+        param-shaped optimizer-state release (``OptimizerTensorInfo.release``).
+
+        Default: nothing. Only the CPU-offload optimizer (HybridDeviceOptimizer)
+        holds such buffers; see :class:`HybridDeviceOptimizerAdapter`.
+        """
+        return
+
 
 class Float16OptimizerAdapter(OptimizerAdapter):
     """Non-distributed float16 optimizer: master lives in fp32_from_float16_groups."""
@@ -426,3 +435,46 @@ class HybridDeviceOptimizerAdapter(PrecisionAwareOptimizerAdapter):
         # dummy_step uses on init); harmless no-op if nothing was offloaded.
         if touched:
             hdo._sync_sub_optimizers_state_to_hdo()
+
+    def release_offload_host_buffers(self) -> None:
+        """Free the HDO's pinned CPU grad buffers (``cpu_copy_map_grad`` — POOL B).
+
+        These pinned fp32 grad buffers (one per offloaded param, ~one master's
+        worth per rank) are allocated lazily on the HDO's first step and held for
+        the life of the HDO. The existing optimizer-state release on core
+        (``OptimizerTensorInfo.release`` over the discovered master + moments, i.e.
+        POOL A) resize_(0)'s only those param-shaped state tensors and never reaches
+        these pinned grad buffers, so a strategy cached across reshards keeps its
+        pinned grad buffers resident -> N cached strategies hold N x this pinned
+        block -> host OOM on long multi-strategy cpu-adam runs.
+
+        Called on the *becoming-dormant* (src) gear during release_optimizer. The
+        HDO re-creates these lazily on the gear's next step (the
+        ``if param not in self.cpu_copy_map_grad`` path in
+        ``_set_sub_optimizer_grads``), so reshard-back is unaffected: POOL A is
+        refilled by rebuild()+transfer, POOL B by that lazy step path.
+
+        POOL A is intentionally NOT touched here — it is pageable fp32 already freed
+        by core's ``OptimizerTensorInfo.release()`` loop in
+        ``TrainingState.release_optimizer``.
+        """
+        hdo = self.optimizer.optimizer
+        for param, grad in hdo.cpu_copy_map_grad.items():
+            # The owning sub-optimizer param holds .grad referencing this buffer; drop
+            # that reference, then resize_(0) frees the pinned block in place (returned
+            # to torch's pinned caching pool for the next gear to reuse). resize_(0),
+            # rather than relying on GC, keeps the free deterministic and is the same
+            # idiom EM uses to free POOL A.
+            if param.grad is grad:
+                param.grad = None
+            grad.untyped_storage().resize_(0)
+        # Clear the map so the HDO's lazy path re-creates fresh pinned buffers on the
+        # gear's next step (it keys on `param not in self.cpu_copy_map_grad`).
+        hdo.cpu_copy_map_grad.clear()
+        # NOTE: no trim_host_memory() here. The POOL-B storages are resize_(0)'d above
+        # (returned to torch's pinned pool); the OS reclaim (gc + empty_host_cache +
+        # malloc_trim) is done ONCE by TrainingState.release_optimizer's trailing
+        # trim_host_memory() after this has run for every chained optimizer. Trimming
+        # per-optimizer here meant 2-3 redundant gc.collect()/malloc_trim passes per
+        # reshard (measured ~5-10s total at 30B, ~all of release_optimizer's time);
+        # consolidating to the single caller-side trim removes that redundancy.
