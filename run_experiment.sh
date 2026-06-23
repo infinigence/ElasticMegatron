@@ -20,6 +20,8 @@
 #   dense_cp_only        —— 仅 CP/Group-Zero 维度 sweep,隔离用
 #   moe_mix_full         —— MoE 8-策略 sweep,含 EP/PP/CP
 #   moe_cp_only          —— EP=2 固定,仅 CP/Group-Zero 维度 sweep,隔离用
+#   dense_scale_world    —— Dense world 8↔4 scale-down/up,走 run_e2e_demo.sh
+#   moe_scale_world      —— MoE world 8↔4 scale-down/up,走 run_moe.sh
 #
 # 关键环境变量:
 #   GPUS_PER_NODE        —— 每节点 GPU 数,默认 4
@@ -60,10 +62,16 @@ export NUM_LAYERS=${NUM_LAYERS:-8}
 # MoE 默认 num_experts=4(让 EP=1 时 4 experts 单卡能装下;EP=2 时每卡 2 experts)
 export NUM_EXPERTS=${NUM_EXPERTS:-4}
 
-# 真实数据 + Llama2 tokenizer(32000 vocab)。覆盖 run_*.sh 里默认的 --mock-data。
-REAL_DATA_PATH=${BASE_PATH}/datasets/wiki_llama2_text_document
-REAL_TOKENIZER_MODEL=${BASE_PATH}/tokenizer/tokenizer.model
-export REAL_DATA_ARGS="${REAL_DATA_ARGS:---data-path ${REAL_DATA_PATH} --split 98,2,0 --tokenizer-type Llama2Tokenizer --tokenizer-model ${REAL_TOKENIZER_MODEL}}"
+# 数据 / tokenizer 路径。leaf 脚本(run_e2e_demo.sh / run_moe.sh)会按文件存在性
+# 自动决定走真实 dataset(A100 上数据齐全)还是退化到 --mock-data(本地无数据),
+# 所以这里只负责导出可覆盖的路径,不再强行设 REAL_DATA_ARGS。
+# 默认对齐 A100:BASE_PATH=/mnt/hisys-data/tonic 时 ${BASE_PATH}/datasets 与
+# ${BASE_PATH}/tokenizer 即真实数据目录。可通过 DATA_DIR / TOKENIZER_DIR /
+# DATA_PREFIX 覆盖。判定细节见 resolve_data_args.sh;A100 上想硬断言真实数据可设
+# ELASTIC_REQUIRE_REAL_DATA=1。显式传非空 REAL_DATA_ARGS 仍是最高优先级覆盖。
+export DATA_DIR=${DATA_DIR:-${BASE_PATH}/datasets}
+export TOKENIZER_DIR=${TOKENIZER_DIR:-${BASE_PATH}/tokenizer}
+export DATA_PREFIX=${DATA_PREFIX:-wiki_llama2_text_document}
 
 # 防御:清掉前一 run 留下的 iter_* ckpt,避免 resume(并行 run 共享同一 ckpt 路径会冲突,
 # 但因为我们没开 --save,也不会真的写出 iter_*,这里只是清残留)
@@ -175,6 +183,26 @@ case "${EXP_NAME}" in
         export ELASTIC_STRATEGY_MODE=moe_cp_only
         export TP=1 PP=1 EP=2 CP=1 NUM_DIST_OPT=1
         export NUM_EXPERTS=8
+        export NUM_LAYERS=${NUM_LAYERS_MOE:-4}
+        export FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-4096}
+        bash "$(dirname "$0")/run_moe.sh"
+        ;;
+    dense_scale_world)
+        # Explicit asymmetric-world dense test: base world=8, target world=4,
+        # then the interval cycle grows back to world=8. Keeps TP/PP/CP fixed.
+        export ELASTIC_ENABLED=1
+        export ELASTIC_STRATEGY_MODE=dense_scale_world
+        export TP=${TP:-1} PP=${PP:-1} CP=${CP:-1} NUM_DIST_OPT=1
+        bash "$(dirname "$0")/run_e2e_demo.sh"
+        ;;
+    moe_scale_world)
+        # Explicit asymmetric-world MoE test: base world=8, target world=4,
+        # preserving TP/PP/CP/EP/TPE. Small-model analogue of the 30B DP2<->DP1
+        # shrink/grow path.
+        export ELASTIC_ENABLED=1
+        export ELASTIC_STRATEGY_MODE=moe_scale_world
+        export TP=${TP:-1} PP=${PP:-1} EP=${EP:-2} CP=${CP:-1} NUM_DIST_OPT=1
+        export NUM_EXPERTS=${NUM_EXPERTS:-8}
         export NUM_LAYERS=${NUM_LAYERS_MOE:-4}
         export FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-4096}
         bash "$(dirname "$0")/run_moe.sh"

@@ -11,14 +11,15 @@ MEGATRON_PATH=${MEGATRON_PATH:?'MEGATRON_PATH is not set. Set it to your Megatro
 _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export PYTHONPATH=${PYTHONPATH:-${_SCRIPT_DIR}:${MEGATRON_PATH}}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-# Short NCCL timeout (60s) so hangs surface quickly during debugging.
+# Short NCCL timeout so hangs surface quickly.
 # Bump this for long real runs.
-export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-1}
-export NCCL_TIMEOUT=${NCCL_TIMEOUT:-60}
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-60}
+export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-0}
+export NCCL_TIMEOUT=${NCCL_TIMEOUT:-30}
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-30}
+TIMEOUT_AFTER_INIT_SEC=${TIMEOUT_AFTER_INIT_SEC:-30}
 
 export OMP_NUM_THREADS=8
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-"0,1,2,3,4,5,6,7"}
@@ -84,18 +85,14 @@ DATA_ARGS=(
     --data-cache-path ${BASE_PATH}/data/data_cache
 )
 # ---------------------------------------------------------------------------
-# 默认 --mock-data + NullTokenizer;runner 传 REAL_DATA_ARGS 时切真实数据。
+# 数据 + tokenizer 部分由 resolve_data_args.sh 按文件存在性自动判定:A100 上数据
+# 齐全走真实 dataset + Llama2 tokenizer,本地无数据则退化到 --mock-data +
+# NullTokenizer(vocab 32000)。判定优先级 / 可覆盖变量(DATA_DIR / TOKENIZER_DIR /
+# DATA_PREFIX / ELASTIC_REQUIRE_REAL_DATA)见该文件。
 # ---------------------------------------------------------------------------
-if [[ -n "${REAL_DATA_ARGS:-}" ]]; then
-    # shellcheck disable=SC2206
-    DATA_ARGS+=(${REAL_DATA_ARGS})
-else
-    DATA_ARGS+=(
-        --tokenizer-type NullTokenizer
-        --vocab-size 32000
-        --mock-data
-    )
-fi
+source "${_SCRIPT_DIR}/resolve_data_args.sh"
+# shellcheck disable=SC2206
+DATA_ARGS+=(${RESOLVED_DATA_ARGS})
 
 TRAINING_ARGS=(
     --micro-batch-size ${MBS:-1}
@@ -113,13 +110,20 @@ TRAINING_ARGS=(
     --seed 1234
 )
 
-# CPU_OFFLOAD=1 builds Megatron's HybridDeviceOptimizer (CPU+GPU mixed optimizer
-# state); requires the precision-aware optimizer code path. OFFLOAD_FRACTION is the
-# fraction of GPU optimizer-state numel pushed to CPU. Default unset → plain GPU Adam.
+TRAINING_ARGS+=(
+    --distributed-timeout-seconds-after-init ${TIMEOUT_AFTER_INIT_SEC}
+)
+
+# CPU_OFFLOAD=1 builds Megatron's HybridDeviceOptimizer (cpu-adam: CPU+GPU mixed
+# optimizer state); requires the precision-aware optimizer path (Megatron asserts
+# this). --overlap-cpu-optimizer-d2h-h2d enables the HDO D2H/H2D streams (Megatron
+# defaults the offload fraction to 1.0 = full offload, matching the slime 30B config).
+# Default OFF — plain GPU Adam (the verify sweep + the GPU-adam perf baseline); set
+# CPU_OFFLOAD=1 for the cpu-adam path.
 if [ "${CPU_OFFLOAD:-0}" = "1" ]; then
     TRAINING_ARGS+=(
         --optimizer-cpu-offload
-        --optimizer-offload-fraction ${OFFLOAD_FRACTION:-0.5}
+        --overlap-cpu-optimizer-d2h-h2d
         --use-precision-aware-optimizer
     )
 fi
@@ -137,7 +141,7 @@ MODEL_PARALLEL_ARGS=(
 RECOMPUTE_ARGS=()
 
 LOGGING_ARGS=(
-    --log-interval 1
+    --log-interval ${LOG_INTERVAL:-1}
     --eval-interval ${EVAL_INTERVAL:-1000}
     --eval-iters ${EVAL_ITERS:-0}
     --no-load-optim

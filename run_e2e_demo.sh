@@ -12,14 +12,15 @@ MEGATRON_PATH=${MEGATRON_PATH:?'MEGATRON_PATH is not set. Set it to your Megatro
 _SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export PYTHONPATH=${PYTHONPATH:-${_SCRIPT_DIR}:${MEGATRON_PATH}}
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-# Short NCCL timeout (60s) so hangs surface quickly during debugging.
+# Short NCCL timeout so hangs surface quickly.
 # Bump this for long real runs.
-export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-1}
-export NCCL_TIMEOUT=${NCCL_TIMEOUT:-60}
-export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-60}
+export TORCH_NCCL_BLOCKING_WAIT=${TORCH_NCCL_BLOCKING_WAIT:-0}
+export NCCL_TIMEOUT=${NCCL_TIMEOUT:-30}
+export TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=${TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC:-30}
+TIMEOUT_AFTER_INIT_SEC=${TIMEOUT_AFTER_INIT_SEC:-30}
 
 export OMP_NUM_THREADS=8
-export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
 
 TP=${TP:-1}
 PP=${PP:-1}
@@ -126,14 +127,17 @@ REGULATIZATION_ARGS=" \
        --adam-eps 1e-8 \
        "
 
-# CPU_OFFLOAD=1 builds Megatron's HybridDeviceOptimizer (CPU+GPU mixed optimizer
-# state) to exercise the hybrid-adam reshard path. It requires the precision-aware
-# optimizer code path (Megatron asserts this). OFFLOAD_FRACTION is the fraction of
-# GPU optimizer-state numel pushed to CPU. Default unset → plain GPU Adam.
+# CPU_OFFLOAD=1 builds Megatron's HybridDeviceOptimizer (cpu-adam: CPU+GPU mixed
+# optimizer state) to exercise the hybrid-adam reshard path. It requires the
+# precision-aware optimizer path (Megatron asserts this).
+# --overlap-cpu-optimizer-d2h-h2d enables the HDO D2H/H2D streams (Megatron defaults
+# the offload fraction to 1.0 = full offload, matching the slime 30B config).
+# Default OFF — plain GPU Adam (the verify sweep + the GPU-adam perf baseline); set
+# CPU_OFFLOAD=1 for the cpu-adam path.
 if [ "${CPU_OFFLOAD:-0}" = "1" ]; then
     CPU_OFFLOAD_ARGS=" \
        --optimizer-cpu-offload \
-       --optimizer-offload-fraction ${OFFLOAD_FRACTION:-0.5} \
+       --overlap-cpu-optimizer-d2h-h2d \
        --use-precision-aware-optimizer \
        "
 else
@@ -160,6 +164,7 @@ TRAINING_ARGS=" \
        ${CPU_OFFLOAD_ARGS} \
        ${RERUN_ARG} \
        --distributed-timeout-minutes 1 \
+       --distributed-timeout-seconds-after-init ${TIMEOUT_AFTER_INIT_SEC} \
        "
 
 RECOMPUTE_ARGS="
@@ -205,32 +210,20 @@ VALIDATION_ARGS=" \
        # --save ${SAVE_PATH} \
        # --save-interval 1000000 \
 
-       # --data-path ${DATA_PATH} \
-       # --split 98,2,0 \
 # ---------------------------------------------------------------------------
-# DATA_ARGS:默认走 --mock-data(self-contained smoke);但如果 runner 把
-# REAL_DATA_ARGS 传进来(见 run_experiment.sh),就用真实 dataset + 真实
-# tokenizer,这样 baseline 和 elastic 的 loss 可以逐 iter 对比。
+# DATA_ARGS:数据 + tokenizer 部分由 resolve_data_args.sh 按文件存在性自动判定
+# (真实 dataset / --mock-data),其余 --seq-length / --num-workers /
+# --dataloader-type / --data-cache-path 在这里拼上。判定优先级 / 可覆盖变量
+# (DATA_DIR / TOKENIZER_DIR / DATA_PREFIX / ELASTIC_REQUIRE_REAL_DATA)见该文件。
 # ---------------------------------------------------------------------------
-if [[ -n "${REAL_DATA_ARGS:-}" ]]; then
+source "${_SCRIPT_DIR}/resolve_data_args.sh"
 DATA_ARGS=" \
-       ${REAL_DATA_ARGS} \
+       ${RESOLVED_DATA_ARGS} \
        --seq-length ${MAX_SEQ_LEN} \
        --num-workers 4 \
        --dataloader-type single \
        --data-cache-path ${DATA_CACHE_PATH} \
        "
-else
-DATA_ARGS=" \
-       --mock-data \
-       --seq-length ${MAX_SEQ_LEN} \
-       --num-workers 4 \
-       --tokenizer-type NullTokenizer \
-       --vocab-size 32000 \
-       --dataloader-type single \
-       --data-cache-path ${DATA_CACHE_PATH} \
-       "
-fi
 
 CMD="${LAUNCHER} \
        ${SRC_PATH} \
