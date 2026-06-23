@@ -3,6 +3,7 @@
 import ctypes
 import gc
 import os
+import time
 
 import torch
 
@@ -35,6 +36,21 @@ def malloc_trim() -> None:
 
 
 def trim_host_memory() -> None:
+    # Gated per-call timing (ELASTIC_RESHARD_PHASE_TIMING=1) to isolate the host-mem
+    # reclaim cost during a reshard; rank-0 only, near-zero overhead when off.
+    _timing = os.environ.get("ELASTIC_RESHARD_PHASE_TIMING", "0") == "1"
+    _t0 = time.perf_counter() if _timing else 0.0
     gc.collect()
     empty_host_cache()
     malloc_trim()
+    if _timing:
+        _dt_ms = (time.perf_counter() - _t0) * 1000.0
+        try:
+            _rank = torch.distributed.get_rank()
+        except Exception:
+            _rank = 0
+        if _rank == 0:
+            print(
+                f"[ElasticMegatron-Perf] : reshard-phase trim_host_memory: {_dt_ms:.2f} ms",
+                flush=True,
+            )

@@ -7,3 +7,4 @@ __pycache__/
 *.log
 tools/ckpt/after_reshard/
 tools/ckpt/before_reshard/
+tools/perf/transfer_plan_dump/
