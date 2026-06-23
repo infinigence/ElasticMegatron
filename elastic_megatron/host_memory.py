@@ -45,10 +45,7 @@ def trim_host_memory() -> None:
     malloc_trim()
     if _timing:
         _dt_ms = (time.perf_counter() - _t0) * 1000.0
-        try:
-            _rank = torch.distributed.get_rank()
-        except Exception:
-            _rank = 0
+        _rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         if _rank == 0:
             print(
                 f"[ElasticMegatron-Perf] : reshard-phase trim_host_memory: {_dt_ms:.2f} ms",

@@ -17,7 +17,7 @@
 # Memory note: 30B on 8x A100-80GB does NOT fit GPU-resident Adam. cpu-adam
 # offload (CPU_OFFLOAD=1) + full activation recompute (RECOMPUTE=1) are ON by
 # default — this mirrors the slime 30B run. OMP_NUM_THREADS=14 keeps cpu-adam
-# from being ~80x slow (S2-fix). Host peak ~1.2 TB for the full elastic run;
+# from being ~80x slower (too few threads starves the CPU optimizer). Host peak ~1.2 TB for the full elastic run;
 # pure pretrain is lighter but still wants a big-RAM box.
 set -ex
 

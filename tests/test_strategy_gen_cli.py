@@ -12,7 +12,7 @@ def _load_strategy_inject():
     return m
 
 
-def test_generate_overrides_parse_through_strategy_inject(monkeypatch=None):
+def test_generate_overrides_parse_through_strategy_inject():
     # llama2-13b keeps a consistent optimizer placement across the 8->4 DP-resize.
     overrides, recipe, table = generate("llama2-13b", gpus=8, gpu_mem_gb=80,
                                         scenario="rl_dp_resize", mbs=1, seq=4096)

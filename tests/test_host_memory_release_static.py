@@ -49,9 +49,11 @@ def test_release_optimizer_flushes_pinned_host_cache():
 def test_hdo_release_frees_pool_b_only():
     """The core HDO override frees POOL B (cpu_copy_map_grad) and leaves POOL A to
     the existing release loop. It must drop the param.grad reference, resize the
-    pinned storage to 0, clear the map (so the HDO lazily re-creates buffers on the
-    next step), and trim host memory. It must NOT reintroduce the union's chunked
-    storage-0 dst-setup helpers."""
+    pinned storage to 0, and clear the map (so the HDO lazily re-creates buffers on
+    the next step). It does NOT trim host memory itself — the OS reclaim runs once
+    per reshard in release_optimizer's trailing trim_host_memory() (asserted in
+    test_release_optimizer_flushes_pinned_host_cache). It must NOT reintroduce the
+    union's chunked storage-0 dst-setup helpers."""
     src = (
         ROOT / "elastic_megatron" / "resharding" / "optimizer_adapter.py"
     ).read_text()
@@ -62,7 +64,9 @@ def test_hdo_release_frees_pool_b_only():
     assert "param.grad = None" in hdo_body
     assert "untyped_storage().resize_(0)" in hdo_body
     assert "cpu_copy_map_grad.clear()" in hdo_body
-    assert "trim_host_memory()" in hdo_body
+    # NB: the override deliberately does NOT trim here — the single OS reclaim is done
+    # once per reshard by release_optimizer (see
+    # test_release_optimizer_flushes_pinned_host_cache).
     # core uses dummy_step for dst init; union-only storage-0 helpers are absent.
     assert "dummy_step()" in hdo_body
     assert "_init_empty_hdo_state" not in hdo_body
@@ -81,7 +85,6 @@ def test_base_release_offload_host_buffers_is_noop():
         "class Float16OptimizerAdapter", 1
     )[0]
     assert "def release_offload_host_buffers(self) -> None:" in base_body
-    assert "from ..host_memory import trim_host_memory" in src
 
 
 if __name__ == "__main__":

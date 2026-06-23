@@ -28,7 +28,7 @@ def _load():
         )
 
         return torch, HybridDeviceOptimizerAdapter
-    except Exception:  # torch / megatron / cpu_offloading not importable here
+    except ImportError:  # torch / megatron / cpu_offloading not importable here
         return None, None
 
 

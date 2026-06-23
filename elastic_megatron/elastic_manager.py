@@ -33,10 +33,7 @@ def _log_reshard_phase(name: str, t_start: float, logger: Logger | None) -> None
     if os.environ.get("ELASTIC_RESHARD_PHASE_TIMING", "0") != "1":
         return
     dt_ms = (time.perf_counter() - t_start) * 1000.0
-    try:
-        rank = torch.distributed.get_rank()
-    except Exception:
-        rank = 0
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     if rank == 0:
         msg = f"[ElasticMegatron-Perf] : reshard-phase {name}: {dt_ms:.2f} ms"
         if logger is not None:

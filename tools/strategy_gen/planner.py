@@ -85,7 +85,7 @@ class LayoutPlanner:
         out.sort(key=lambda layout: (-layout.dp, layout.tp, layout.pp, layout.cp, layout.ep))
         return out
 
-    def best(self, arch: ModelArch, world: int, run_shape: RunShape, cpu_adam) -> Layout:
+    def best(self, arch: ModelArch, world: int, run_shape: RunShape, cpu_adam: bool | str) -> Layout:
         modes = [False, True] if cpu_adam == "auto" else [bool(cpu_adam)]
         for mode in modes:
             cand = self.feasible(arch, world, run_shape, mode)
