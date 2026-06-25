@@ -2,7 +2,7 @@
 # -----------------------------------------------------------------------------
 # resolve_data_args.sh —— 真实数据 / mock 数据自动判定(按文件存在性退化)
 #
-# 被各 launcher(run_e2e_demo.sh / run_moe.sh / run_qwen3_30b.sh)source 进来。
+# 被各 launcher(run_dense.sh / run_qwen3_30b.sh)source 进来。
 # 目的:同一个脚本既能在 A100(数据齐全)上跑 *真实* dataset + 真实 tokenizer,
 # 也能在没有数据的机器(本地 dev)上自动退化到 --mock-data + NullTokenizer,而
 # 不是把不存在的 --data-path 丢给 Megatron 直接崩。

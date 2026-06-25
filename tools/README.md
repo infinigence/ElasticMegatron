@@ -41,7 +41,10 @@ Verifying one round of reshard transitions:
 # 1. Train with ElasticMegatron saving before/after-reshard ckpts to
 #    tools/ckpt/{before,after}_reshard/iter_N/
 ELASTIC_SAVE_CKPT=1 TRAIN_ITERS=9 ELASTIC_RESHARD_INTERVAL=1 \
-  ./run_experiment.sh dense_mix_full
+  ELASTIC_ENABLED=1 ELASTIC_STRATEGY_LIST_FILE=examples/strategies/precision/dense_no_tp.json \
+  ./run_dense.sh
+#    (a committed/generated sequence — see examples/strategies/README.md;
+#     generate your own via: python3 -m tools.strategy_gen --model ... --scenario ...)
 
 # 2. Offline batch-verify every (before, after) ckpt pair
 DEVICES=0,1,2 bash tools/ckpt/verify_all.sh cuda

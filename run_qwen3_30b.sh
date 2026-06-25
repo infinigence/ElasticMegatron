@@ -1,15 +1,18 @@
 #!/bin/bash
 
 # Runs Qwen3-30B-A3B (MoE: 128 experts, top-8) on a single 8-GPU node through
-# MEGATRON_PATH/pretrain_gpt.py. By default this is pure Megatron
-# (ELASTIC_ENABLED=0); setting ELASTIC_ENABLED=1 and ELASTIC_STRATEGY_MODE=moe_30b
-# exercises the TP4/EP4 DP2<->DP1 ElasticMegatron reshard path.
+# MEGATRON_PATH/pretrain_gpt.py. Defaults reproduce Qwen3-30B-A3B exactly, but the
+# arch/MoE knobs are overridable (NUM_LAYERS/NUM_EXPERTS/HIDDEN_SIZE/MOE_ROUTER_TOPK/...)
+# so this script also serves smaller MoE smokes. By default this is pure Megatron
+# (ELASTIC_ENABLED=0); setting ELASTIC_ENABLED=1 with a reshard sequence
+# (ELASTIC_STRATEGY_LIST='[{}, {"world_size": 4}]' or
+# ELASTIC_STRATEGY_LIST_FILE=examples/strategies/moe_30b.json) plus
+# ELASTIC_RESHARD_INTERVAL exercises the TP4/EP4 DP2<->DP1 reshard path.
 #
 # Megatron args are transcribed from slime's source of truth:
 #   slime-trainer/configs/models/qwen3-30B-A3B.sh   (architecture + MoE block)
 #   + the slime 30B launcher's parallel dims TP4/PP1/CP1/EP4/ETP1 and training
 #     shape (mbs1/gbs64/seq4096, full recompute, cpu-adam).
-# Precedent / cross-check: agent_docs/runs/pure-megatron-30b-a100-ncclverbose-20260615/.
 #
 # Memory note: 30B on 8x A100-80GB does NOT fit GPU-resident Adam. cpu-adam
 # offload (CPU_OFFLOAD=1) + full activation recompute (RECOMPUTE=1) are ON by
@@ -77,6 +80,13 @@ DISTRIBUTED_ARGS=(
     --master_port $MASTER_PORT
 )
 
+# Qwen3 architecture knobs are overridable so this script also covers smaller MoE
+# smokes (e.g. TP=1 EP=2 NUM_LAYERS=2 NUM_EXPERTS=8 HIDDEN_SIZE=256 MOE_ROUTER_TOPK=2).
+# Default values reproduce Qwen3-30B-A3B exactly. QK_LAYERNORM=0 drops --qk-layernorm.
+# --sequence-parallel is only valid for TP>1, so gate it on TP (TP=1 smokes need it off).
+QK_LAYERNORM_ARG=$([ "${QK_LAYERNORM:-1}" = "1" ] && echo "--qk-layernorm")
+SEQUENCE_PARALLEL_ARG=$([ "${TP:-4}" -gt 1 ] && echo "--sequence-parallel")
+
 MODEL_ARGS=(
     --use-mcore-models
     --transformer-impl transformer_engine
@@ -89,8 +99,8 @@ MODEL_ARGS=(
     --num-attention-heads ${NUM_HEAD:-32}
     --group-query-attention
     --num-query-groups ${NUM_QUERY_GROUP:-4}
-    --kv-channels 128
-    --qk-layernorm
+    --kv-channels ${KV_CHANNELS:-128}
+    ${QK_LAYERNORM_ARG}
     --init-method-std 0.02
     --attention-dropout 0.0
     --hidden-dropout 0.0
@@ -108,9 +118,9 @@ MODEL_ARGS=(
 
 MOE_ARGS=(
     --num-experts ${NUM_EXPERTS}
-    --moe-ffn-hidden-size 768
-    --moe-router-topk 8
-    --moe-router-score-function softmax
+    --moe-ffn-hidden-size ${MOE_FFN_HIDDEN_SIZE:-768}
+    --moe-router-topk ${MOE_ROUTER_TOPK:-8}
+    --moe-router-score-function ${MOE_SCORE_FUNCTION:-softmax}
     --moe-router-load-balancing-type aux_loss
     --moe-aux-loss-coeff 0
     --moe-token-dispatcher-type alltoall
@@ -178,7 +188,7 @@ MODEL_PARALLEL_ARGS=(
     --expert-tensor-parallel-size ${TPE}
     --num-distributed-optimizer-instances ${NUM_DIST_OPT:-1}
     --use-distributed-optimizer
-    --sequence-parallel
+    ${SEQUENCE_PARALLEL_ARG}
 )
 
 # Full activation recompute is ON by default — 30B does not fit otherwise.

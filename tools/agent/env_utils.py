@@ -276,7 +276,7 @@ def _start_new_megatron_proc(scale_action):
         new_env["MASTER_PORT"] = str(int(os.environ.get("MASTER_PORT")) + 1)
         p2 = Process(
             target=_exec_wrapper,
-            args=("bash", ["bash", "run_e2e_demo.sh"], new_env, log_path_2),
+            args=("bash", ["bash", "run_dense.sh"], new_env, log_path_2),
         )
         p2.start()
 
@@ -302,7 +302,7 @@ def _start_new_megatron_proc(scale_action):
             )
             p = Process(
                 target=_exec_wrapper,
-                args=("bash", ["bash", "run_e2e_demo.sh"], new_env_proc_2, log_path),
+                args=("bash", ["bash", "run_dense.sh"], new_env_proc_2, log_path),
             )
             p.start()
 
@@ -318,7 +318,7 @@ def _start_new_megatron_proc(scale_action):
         new_env["TP"] = "1"
         p = Process(
             target=_exec_wrapper,
-            args=("bash", ["bash", "run_e2e_demo.sh"], new_env, log_path),
+            args=("bash", ["bash", "run_dense.sh"], new_env, log_path),
         )
         p.start()
 

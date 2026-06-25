@@ -27,7 +27,7 @@ Three files:
 
 The bulk of the integration:
 
-- `init_parallel_strategy_list()` — builds the list of `(parallel_strategy, ...)` candidates from `ELASTIC_STRATEGY_MODE` env var. Phase B adds 4 8-GPU modes: `dense_mix_full`, `dense_cp_only`, `moe_mix_full`, `moe_cp_only`.
+- `init_parallel_strategy_list()` — derives `base` (the launch config) from args, then merges the injected reshard sequence onto it via `elastic_megatron.strategy_inject.build_strategy_list` (`ELASTIC_STRATEGY_LIST` inline JSON override-dicts, or `ELASTIC_STRATEGY_LIST_FILE`; default `[{}]` = no reshard). The former hardcoded `ELASTIC_STRATEGY_MODE` sweeps now live as data under [`examples/strategies/`](../../examples/strategies/).
 - `check_reshard(iteration)` — picks the next strategy when `iteration % ELASTIC_RESHARD_INTERVAL == 0`.
 - `init_elastic_megatron_manager()` — wires the strategy list into `ElasticMegatronManager`.
 - The elastic loop inside `train()` — the `if elastic_megatron_manager: ...` block, using plain rebind `model = training_state.model` (see [`invariants.md`](invariants.md) I-6). The launcher must run with `--eval-iters 0` and no `--save` under this convention.
@@ -45,7 +45,7 @@ The bulk of the integration:
 The Megatron side is allowed to:
 
 - Import `elastic_megatron` (this repo, must be importable on `PYTHONPATH`).
-- Read env vars: `ELASTIC_ENABLED`, `ELASTIC_STRATEGY_MODE`, `ELASTIC_RESHARD_INTERVAL`, `ELASTIC_SAVE_CKPT`, `ELASTIC_DUMP_INPUTS`.
+- Read env vars: `ELASTIC_ENABLED`, `ELASTIC_STRATEGY_LIST` / `ELASTIC_STRATEGY_LIST_FILE`, `ELASTIC_RESHARD_INTERVAL`, `ELASTIC_SAVE_CKPT`, `ELASTIC_DUMP_INPUTS`.
 - Call `ElasticMegatronManager.register(...)` and `elastic_megatron_manager.reshard(...)` / `.build_iterators()`.
 
 The Megatron side **must**:
@@ -69,12 +69,18 @@ The patches are intentionally minimal and confined to a handful of clearly-named
 
 So the contract is: **`examples/intra_process/training_*.py` is the source of truth for what Megatron needs to look like; copy/diff into your target Megatron checkout.**
 
+> **Note (strategy injection / stale 0.11):** `training_016.py` (0.16) was refactored so the reshard
+> strategy list is **injected from the launcher** (`ELASTIC_STRATEGY_LIST` / `ELASTIC_STRATEGY_LIST_FILE`
+> → `elastic_megatron/strategy_inject.py`) instead of selected by a hardcoded `ELASTIC_STRATEGY_MODE`.
+> `training_011.py` (0.11) is **stale** — it still carries the old `ELASTIC_STRATEGY_MODE` machinery and
+> was intentionally not updated; port the same thinning if 0.11 is revived.
+
 ## Working with the customized Megatron in this repo
 
 When working on changes that span both repos:
 
 1. Make the changes in `Megatron-LM-custom/megatron/training/training.py` (and `pretrain_gpt.py` if needed).
-2. Test end-to-end with `./run_experiment.sh <mode>`.
+2. Test end-to-end with `ELASTIC_ENABLED=1 ELASTIC_STRATEGY_LIST_FILE=examples/strategies/<name>.json ./run_dense.sh` (or `run_qwen3_30b.sh`).
 3. Before commit, **copy** the new state of `Megatron-LM-custom/megatron/training/training.py` into `examples/intra_process/training_016.py`:
    ```bash
    cp /mnt/hisys-data/tonic/Megatron-LM-custom/megatron/training/training.py \

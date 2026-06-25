@@ -1,6 +1,12 @@
 #!/bin/bash
 set -ex
 
+# Llama2-style DENSE training launcher (Megatron 0.16, pretrain_gpt.py).
+# Model size via MODEL_SIZE (tiny/medium/7/13/70/130) + NUM_LAYERS; parallel layout via
+# TP/PP/CP. Elastic reshard: set ELASTIC_ENABLED=1 + ELASTIC_STRATEGY_LIST (inline JSON
+# override-dict list) or ELASTIC_STRATEGY_LIST_FILE, plus ELASTIC_RESHARD_INTERVAL.
+# For Qwen3-30B-A3B and MoE (incl. small MoE smokes), use run_qwen3_30b.sh.
+
 export PYTHONHASHSEED=1234
 export TORCH_MANUAL_SEED=1234
 

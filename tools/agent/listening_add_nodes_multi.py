@@ -26,7 +26,7 @@ def listen_for_master_command():
         env["MASTER_PORT"] = "6369"
         env["NEW_NODE"] = "1"
 
-        cmd = ["../../run_e2e_demo.sh"]
+        cmd = ["../../run_dense.sh"]
         subprocess.Popen(cmd, env=env)
 
 

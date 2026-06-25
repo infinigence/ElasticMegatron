@@ -157,31 +157,21 @@ _PARALLEL_STRATEGY_LIST = None
 
 
 def init_parallel_strategy_list():
-    """Build the list of parallel strategies that this job can switch between.
+    """Build the list of parallel strategies this job can switch between.
 
-    The first entry MUST match the launcher args (check_consistency is enforced
-    by ElasticMegatron). Later entries define reshard targets.
+    ``strategy[0]`` is always the launch config (``base``, derived from ``args``); later
+    entries are reshard targets. The reshard sequence is INJECTED from the launcher as a
+    list of override-dicts merged onto ``base`` — see
+    ``elastic_megatron.strategy_inject`` (``ELASTIC_STRATEGY_LIST`` inline JSON, or
+    ``ELASTIC_STRATEGY_LIST_FILE``; default ``[{}]`` = no reshard).
 
-    ELASTIC_STRATEGY_MODE selects the reshard pattern:
-      - "tp_flip" (default):  swap TP <-> DP on a 2-GPU setup
-      - "ep_flip":            swap EP <-> expert_DP on a 2-GPU MoE setup
-      - "dense_mix":          8-GPU dense sweep across TP/PP/DP combinations
-      - "moe_mix":            8-GPU MoE sweep across TP/PP/EP/DP combinations (TPE=1)
-      - "dense_mix_full":     8-GPU dense sweep including CP and Group-Zero (Phase B)
-      - "moe_mix_full":       8-GPU MoE sweep including CP (Phase B)
-      - "dense_cp_only":      8-GPU dense sweep that ONLY varies CP and Group-Zero
-      - "moe_cp_only":        8-GPU MoE sweep that ONLY varies CP (with EP fixed)
-      - "dense_scale_world":  dense scale down/up, world 8 <-> 4 with TP/PP/CP fixed
-      - "moe_scale_world":    MoE scale down/up, world 8 <-> 4 with TP/PP/CP/EP fixed
-      - "moe_30b":            fixed TP4/PP1/CP1/EP4 (ETP1), scale DP2<->DP1 (world 8<->4)
-
-    Group-Zero (num_distributed_optimizer_instances>1) requires CP>1 and a
-    world_size change (scale up/down); switching dgz at fixed world_size is
-    unsupported, so the _full / _cp_only modes omit dgz!=1 strategies.
+    Example (8<->4 DP rescale): ELASTIC_STRATEGY_LIST='[{}, {"world_size": 4}]'
     """
     global _PARALLEL_STRATEGY_LIST
     if _PARALLEL_STRATEGY_LIST is not None:
         return
+    from elastic_megatron.strategy_inject import build_strategy_list
+
     args = get_args()
     base = {
         "world_size": args.world_size,
@@ -197,173 +187,7 @@ def init_parallel_strategy_list():
         ),
         "sequence_parallel": args.sequence_parallel,
     }
-
-    def _mk(tp=None, pp=None, ep=None, tpe=None, cp=None, dgz=None):
-        """Return a strategy dict with only the specified dimensions overridden."""
-        d = dict(base)
-        if tp is not None:
-            d["tensor_model_parallel_size"] = tp
-            d["sequence_parallel"] = tp > 1
-        if pp is not None:
-            d["pipeline_model_parallel_size"] = pp
-        if ep is not None:
-            d["expert_model_parallel_size"] = ep
-        if tpe is not None:
-            d["expert_tensor_parallel_size"] = tpe
-        if cp is not None:
-            d["context_parallel_size"] = cp
-        if dgz is not None:
-            d["num_distributed_optimizer_instances"] = dgz
-        return d
-
-    mode = os.environ.get("ELASTIC_STRATEGY_MODE", "tp_flip")
-    if mode == "ep_flip":
-        # Flip EP <-> expert-DP on a 2-GPU MoE setup: EP=2 <-> EP=1.
-        assert args.expert_model_parallel_size in (1, 2), (
-            "ep_flip mode currently only supports EP in {1, 2}"
-        )
-        second = _mk(ep=1 if args.expert_model_parallel_size == 2 else 2)
-        _PARALLEL_STRATEGY_LIST = [base, second]
-    elif mode == "dense_mix":
-        # 8-GPU dense sweep. Requires world_size=8, num_layers divisible by each PP.
-        assert args.world_size == 8, "dense_mix expects world_size=8"
-        assert args.num_layers % 4 == 0, (
-            "dense_mix includes PP=4; num_layers must be divisible by 4"
-        )
-        _PARALLEL_STRATEGY_LIST = [
-            base,                       # launcher args, must come first
-            _mk(tp=2, pp=1),            # TP=2/DP=4
-            _mk(tp=2, pp=2),            # TP=2/PP=2/DP=2
-            _mk(tp=1, pp=2),            # PP=2/DP=4
-            _mk(tp=4, pp=1),            # TP=4/DP=2
-            _mk(tp=1, pp=4),            # PP=4/DP=2
-            _mk(tp=2, pp=4),            # TP=2/PP=4/DP=1
-            _mk(tp=8, pp=1),            # TP=8/DP=1
-        ]
-    elif mode == "moe_mix":
-        # 8-GPU MoE sweep. TPE stays 1 (ElasticMegatron constraint).
-        # num_experts must be divisible by every EP in the list.
-        assert args.world_size == 8, "moe_mix expects world_size=8"
-        assert args.num_experts and args.num_experts % 8 == 0, (
-            "moe_mix includes EP=8; num_experts must be divisible by 8"
-        )
-        _PARALLEL_STRATEGY_LIST = [
-            base,                       # launcher args
-            _mk(tp=1, pp=1, ep=4),      # EP=4/DP=2
-            _mk(tp=1, pp=1, ep=8),      # EP=8/DP=1
-            _mk(tp=1, pp=1, ep=1),      # pure DP=8
-            _mk(tp=2, pp=1, ep=1),      # TP=2/DP=4
-            _mk(tp=2, pp=1, ep=2),      # TP=2/EP=2/DP=2
-            _mk(tp=2, pp=1, ep=4),      # TP=2/EP=4/DP=1
-            _mk(tp=1, pp=2, ep=2),      # PP=2/EP=2/DP=2
-        ]
-    elif mode == "dense_mix_full":
-        # 8-GPU dense sweep including CP. Group-Zero requires world_size change
-        # (is_redundant_backup path), so dgz!=1 is excluded at fixed world_size=8.
-        assert args.world_size == 8, "dense_mix_full expects world_size=8"
-        assert args.num_layers % 4 == 0, (
-            "dense_mix_full includes PP=4; num_layers must be divisible by 4"
-        )
-        _PARALLEL_STRATEGY_LIST = [
-            base,                                       # launcher args (TP=1/CP=1/DP=8)
-            _mk(tp=2, pp=1),                            # TP=2/DP=4
-            _mk(tp=1, pp=2),                            # PP=2/DP=4
-            _mk(tp=1, pp=1, cp=2),                      # CP=2/DP=4   (新)
-            _mk(tp=1, pp=1, cp=4),                      # CP=4/DP=2   (新)
-            _mk(tp=2, pp=2),                            # TP=2/PP=2/DP=2
-            _mk(tp=4, pp=1),                            # TP=4/DP=2
-            _mk(tp=1, pp=4),                            # PP=4/DP=2
-        ]
-    elif mode == "dense_cp_only":
-        # 8-GPU dense sweep that ONLY varies CP. TP/PP fixed at 1.
-        assert args.world_size == 8, "dense_cp_only expects world_size=8"
-        _PARALLEL_STRATEGY_LIST = [
-            base,                                       # CP=1/DP=8 (assumed launcher)
-            _mk(cp=2),                                  # CP=2/DP=4
-            _mk(cp=4),                                  # CP=4/DP=2
-            _mk(cp=8),                                  # CP=8/DP=1
-        ]
-    elif mode == "moe_mix_full":
-        # 8-GPU MoE sweep including CP. TPE stays 1.
-        # num_experts must be divisible by every EP in the list.
-        # No strategy may duplicate base (triggers _parallel_strategy_to_megatron_state assert).
-        assert args.world_size == 8, "moe_mix_full expects world_size=8"
-        assert args.num_experts and args.num_experts % 8 == 0, (
-            "moe_mix_full includes EP=8; num_experts must be divisible by 8"
-        )
-        _PARALLEL_STRATEGY_LIST = [
-            base,                                       # launcher EP=2/DP=4/CP=1
-            _mk(tp=1, pp=1, ep=4),                      # EP=4/DP=2
-            _mk(tp=1, pp=1, ep=8),                      # EP=8/DP=1
-            _mk(tp=1, pp=1, ep=1),                      # pure DP=8 (EP>1 → EP=1)
-            _mk(tp=1, pp=1, ep=2, cp=2),                # CP=2/EP=2/DP=2 (EP=1 → EP>1)
-            _mk(tp=2, pp=1, ep=2),                      # TP=2/EP=2/DP=2
-            _mk(tp=1, pp=2, ep=2),                      # PP=2/EP=2/DP=2
-            _mk(tp=2, pp=1, ep=4),                      # TP=2/EP=4/DP=1
-        ]
-    elif mode == "moe_cp_only":
-        # 8-GPU MoE sweep ONLY varying CP. EP fixed at 2. Isolates CP×MoE interactions.
-        assert args.world_size == 8, "moe_cp_only expects world_size=8"
-        _PARALLEL_STRATEGY_LIST = [
-            base,                                       # EP=2/CP=1/DP=4
-            _mk(cp=2),                                  # CP=2/EP=2/DP=2
-            _mk(cp=4),                                  # CP=4/EP=2/DP=1
-        ]
-    elif mode == "moe_30b":
-        # 30B-A3B cpu-adam overlap benchmark. Fixed TP4/PP1/CP1/EP4/ETP1;
-        # reshard only the DP dimension by scaling world 8<->4:
-        # TP4/EP4/DP2/W8 -> TP4/EP4/DP1/W4 -> TP4/EP4/DP2/W8.
-        assert args.world_size == 8, "moe_30b expects launcher world_size=8 (DP2 base)"
-        assert (
-            args.tensor_model_parallel_size == 4
-            and args.expert_model_parallel_size == 4
-            and args.pipeline_model_parallel_size == 1
-            and args.context_parallel_size == 1
-        ), "moe_30b base must be TP4/PP1/CP1/EP4 (matches run_qwen3_30b.sh defaults)"
-        assert args.num_experts and args.num_experts % 4 == 0, (
-            "moe_30b uses EP4; num_experts must be divisible by 4"
-        )
-        dp1 = dict(base)
-        dp1["world_size"] = 4
-        _PARALLEL_STRATEGY_LIST = [base, dp1]
-    elif mode == "dense_scale_world":
-        # Explicit asymmetric-world dense coverage: keep TP/PP/CP/DGZ fixed and
-        # shrink only DP by scaling the logical world 8->4, then grow back via the
-        # normal strategy cycle. This is intentionally separate from dense_mix_full,
-        # whose existing entries all keep every physical rank active.
-        assert args.world_size == 8, "dense_scale_world expects launcher world_size=8"
-        assert args.world_size // 2 >= (
-            args.tensor_model_parallel_size
-            * args.pipeline_model_parallel_size
-            * args.context_parallel_size
-        ), "dense_scale_world target world_size=4 must fit TP*PP*CP"
-        down = dict(base)
-        down["world_size"] = 4
-        _PARALLEL_STRATEGY_LIST = [base, down]
-    elif mode == "moe_scale_world":
-        # Explicit asymmetric-world MoE coverage: same as dense_scale_world, but
-        # preserves EP/TPE as well. This exercises the small-model analogue of the
-        # 30B TP4/EP4 DP2<->DP1 path without requiring the 30B footprint.
-        assert args.world_size == 8, "moe_scale_world expects launcher world_size=8"
-        assert args.world_size // 2 >= (
-            args.tensor_model_parallel_size
-            * args.pipeline_model_parallel_size
-            * args.context_parallel_size
-            * args.expert_model_parallel_size
-        ), "moe_scale_world target world_size=4 must fit TP*PP*CP*EP"
-        down = dict(base)
-        down["world_size"] = 4
-        _PARALLEL_STRATEGY_LIST = [base, down]
-    else:
-        # "tp_flip": Flip TP <-> DP on a 2-GPU setup: TP=1/DP=2 <-> TP=2/DP=1.
-        second = dict(base)
-        if args.tensor_model_parallel_size == 1 and args.world_size >= 2:
-            second["tensor_model_parallel_size"] = 2
-            second["sequence_parallel"] = True
-        elif args.tensor_model_parallel_size >= 2:
-            second["tensor_model_parallel_size"] = 1
-            second["sequence_parallel"] = False
-        _PARALLEL_STRATEGY_LIST = [base, second]
+    _PARALLEL_STRATEGY_LIST = build_strategy_list(base)
 
 
 def get_parallel_strategy_list():
