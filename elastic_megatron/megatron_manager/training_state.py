@@ -388,6 +388,13 @@ class TrainingState:
         is_before_reshard: bool = True,
         save_path: str | None = None,
     ):
+        # On a scale-down (world-shrink) reshard, redirect the DCP save collective
+        # to the current elastic world group; otherwise the inactive ranks feed a
+        # None SavePlan into DCP's dedup_save_plans and the after_reshard save
+        # crashes. No-op for full-world (symmetric / scale-up) saves.
+        from ..distributed.dist_ckpt_patch import ensure_dist_ckpt_save_patched
+
+        ensure_dist_ckpt_save_patched()
         args = get_args()
         if iteration is None:
             iteration = getattr(args, "curr_iteration", 0) + 1
