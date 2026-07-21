@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 
 import torch
@@ -11,6 +12,7 @@ from ..megatron_manager.training_state import (
     load_state_dict_with_no_step,
     update_optimizer_by_state_dict,
 )
+from ..resharding.optimizer_adapter import OptimizerAdapter
 from ..resharding.resharding import ReshardPlan
 from ..resharding.resharding_metadata import OptimizerTensorInfo
 from ..resharding.resharding_pp import LayerType, ParamPositionAttr
@@ -299,6 +301,43 @@ class TransferManager:
             print(msg, flush=True)
         torch.distributed.barrier()
 
+    @staticmethod
+    def _new_subphase_events() -> dict | None:
+        """CUDA timing events for the transfer sub-phases, or None when not gated."""
+        if os.environ.get("ELASTIC_RESHARD_PHASE_TIMING", "0") != "1":
+            return None
+        names = ("start", "pre", "main", "post", "embed")
+        return {name: torch.cuda.Event(enable_timing=True) for name in names}
+
+    def _log_subphase_timing(self, events: dict) -> None:
+        """Reduce (MAX) the per-sweep elapsed times and print one rank-0 line.
+
+        Bare all_reduce over the default group, matching ``log_communication_info`` —
+        in intra-process mode the union world is the full torch world and every union
+        rank reaches the transfer.
+        """
+        torch.cuda.synchronize()
+        pre = events["start"].elapsed_time(events["pre"])
+        main = events["pre"].elapsed_time(events["main"])
+        post = events["main"].elapsed_time(events["post"])
+        embed = events["post"].elapsed_time(events["embed"])
+
+        info = torch.tensor(
+            [pre, main, post, embed],
+            device=torch.cuda.current_device(),
+            dtype=torch.float32,
+        )
+        torch.distributed.all_reduce(info, op=torch.distributed.ReduceOp.MAX)
+
+        if self._rank == 0:
+            pre, main, post, embed = info.tolist()
+            print(
+                "[ElasticMegatron-Perf] : transfer-subphase "
+                f"pre={pre:.2f} main={main:.2f} post={post:.2f} embed={embed:.2f} "
+                f"total={pre + main + post + embed:.2f} ms",
+                flush=True,
+            )
+
     def transfer_optimizer_tensors(
         self, virtual_param_space: VirtualParamSpace, use_block_and_print: bool = False
     ):
@@ -342,14 +381,32 @@ class TransferManager:
 
                 process_fn(virtual_param)
 
+        # Gated CUDA-event sub-phase profiler (ELASTIC_RESHARD_PHASE_TIMING=1): breaks
+        # the otherwise-opaque transfer block into pre/main/post/embed. Faithful — no
+        # per-sweep sync, a single synchronize when reading elapsed_time.
+        events = self._new_subphase_events()
+
+        if events is not None:
+            events["start"].record()
         process_virtual_params(self._pre_process)
+        if events is not None:
+            events["pre"].record()
+
         process_virtual_params(self._main_process)
+        if events is not None:
+            events["main"].record()
+
         process_virtual_params(self._post_process)
+        if events is not None:
+            events["post"].record()
 
         self.transfer_word_embedding_and_output_layer(
             virtual_param_space.all_virtual_params[0],
             virtual_param_space.all_virtual_params[-1],
         )
+        if events is not None:
+            events["embed"].record()
+            self._log_subphase_timing(events)
 
     def redundant_backup(
         self,
@@ -408,6 +465,11 @@ class TransferManager:
     ):
         for optimizer in optimizers:
             self._transfer_optimizer_state_dict(optimizer)
+            # The reshard cannot carry the per-param Adam step (dropped as
+            # non-param-shaped, I-15); restore it from the param_groups step just
+            # broadcast above, for optimizers that keep step per-param (CPU-offload
+            # HDO). No-op for every other optimizer. Runs on each dst-active rank.
+            OptimizerAdapter.create(optimizer).repair_per_param_step()
         self._transfer_param_scheduler(opt_param_scheduler)
 
     def _transfer_optimizer_state_dict(

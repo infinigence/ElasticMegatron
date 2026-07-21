@@ -51,14 +51,26 @@ That checkout is **not under git** — the canonical source of the patches lives
 
 ## Running a smoke test / verifying reshard
 
+Two param-driven launchers: **`run_dense.sh`** (llama2 dense) and **`run_qwen3_30b.sh`**
+(Qwen3-30B-A3B, also covers small MoE smokes at small `NUM_LAYERS`/`NUM_EXPERTS`). The reshard
+sequence is **injected** via `ELASTIC_STRATEGY_LIST` (inline JSON override-dict list) or
+`ELASTIC_STRATEGY_LIST_FILE` (see `examples/strategies/`) — not a hardcoded mode.
+
 ```bash
-# 4-GPU reshard sweep (quick functional check; loss should converge):
-MEGATRON_PATH=/path/to/Megatron-LM-custom ./run_experiment.sh dense_mix     # dense
-MEGATRON_PATH=/path/to/Megatron-LM-custom ./run_experiment.sh moe_mix       # MoE
+# 4-GPU dense reshard (quick functional check; loss should converge):
+MEGATRON_PATH=/path/to/Megatron-LM-custom \
+  ELASTIC_ENABLED=1 ELASTIC_RESHARD_INTERVAL=5 \
+  ELASTIC_STRATEGY_LIST_FILE=examples/strategies/precision/dense_no_tp.json ./run_dense.sh
+
+# Qwen3-30B / small MoE reshard (world 8<->4):
+MEGATRON_PATH=/path/to/Megatron-LM-custom \
+  ELASTIC_ENABLED=1 ELASTIC_RESHARD_INTERVAL=2 \
+  ELASTIC_STRATEGY_LIST='[{}, {"world_size": 4}]' ./run_qwen3_30b.sh
 
 # 8-GPU bit-exact ckpt-level verification (the trustworthy correctness signal):
-#   1. run a *_full mode with ELASTIC_SAVE_CKPT=1 → before/after ckpts under tools/ckpt/
-#   2. tools/ckpt/verify_all.sh compares them via compare_dcp.py + compare_optim_logical.py
+#   1. run with ELASTIC_SAVE_CKPT=1 + a strategy list → before/after ckpts under tools/ckpt/
+#      e.g. ELASTIC_STRATEGY_LIST_FILE=examples/strategies/precision/dense_no_tp.json ./run_dense.sh
+#   2. tools/ckpt/verify_all.py compares them via compare_dcp.py + compare_optim_logical.py
 ```
 
 - **Loss curves cannot validate reshard** — identical baselines already diverge by the NCCL/

@@ -16,6 +16,7 @@ from megatron.training.checkpointing import save_checkpoint
 from megatron.training.global_vars import get_args, get_timers
 from megatron.training.training import preprocess_common_state_dict
 
+from ..host_memory import trim_host_memory
 from ..resharding.optimizer_adapter import OptimizerAdapter
 from ..resharding.resharding_metadata import (
     OptimizerTensorInfo,
@@ -358,6 +359,18 @@ class TrainingState:
     def release_optimizer(self):
         for optimizer_tensor_info in self.optimizer_tensor_info_list:
             optimizer_tensor_info.release()
+        # The per-param release above resize_(0)'s the param-shaped master + moments
+        # (POOL A). The CPU-offload optimizer (HybridDeviceOptimizer) also holds
+        # pinned host grad buffers (POOL B) that nothing above reaches; free them on
+        # this becoming-dormant gear so they don't accumulate N x across cached
+        # strategies. No-op for non-offload optimizers; lazily re-created on the
+        # gear's next step (see HybridDeviceOptimizerAdapter.release_offload_host_buffers).
+        # Default ON; ELASTIC_RELEASE_HDO_HOST_BUFFERS=0 reverts to the old (leaking)
+        # behaviour for A/B measurement and as a safety hatch.
+        if os.environ.get("ELASTIC_RELEASE_HDO_HOST_BUFFERS", "1") == "1":
+            for optimizer in self.optimizers:
+                OptimizerAdapter.create(optimizer).release_offload_host_buffers()
+        trim_host_memory()
 
     def rebuild_optimizer(self):
         for optimizer_tensor_info in self.optimizer_tensor_info_list:
@@ -375,6 +388,13 @@ class TrainingState:
         is_before_reshard: bool = True,
         save_path: str | None = None,
     ):
+        # On a scale-down (world-shrink) reshard, redirect the DCP save collective
+        # to the current elastic world group; otherwise the inactive ranks feed a
+        # None SavePlan into DCP's dedup_save_plans and the after_reshard save
+        # crashes. No-op for full-world (symmetric / scale-up) saves.
+        from ..distributed.dist_ckpt_patch import ensure_dist_ckpt_save_patched
+
+        ensure_dist_ckpt_save_patched()
         args = get_args()
         if iteration is None:
             iteration = getattr(args, "curr_iteration", 0) + 1

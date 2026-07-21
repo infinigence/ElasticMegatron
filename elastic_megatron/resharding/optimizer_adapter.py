@@ -34,6 +34,13 @@ from megatron.core.optimizer import DistributedOptimizer, MegatronOptimizer
 
 from .util import ParamRange, Range
 
+
+def _optimizer_param_generator(torch_optimizer):
+    for group in torch_optimizer.param_groups:
+        for param in group["params"]:
+            yield param
+
+
 # Canonical ordering of per-param optimizer-state keys. The SRC side discovers
 # states from an already-initialized optimizer.state dict; the DST side allocates
 # empty placeholders during offload. The transfer zips src/dst optimizer_tensors
@@ -247,6 +254,28 @@ class OptimizerAdapter:
         """Refill model param_data from the (transferred) masters after a reshard."""
         self.optimizer._copy_main_params_to_model_params()
 
+    def repair_per_param_step(self) -> None:
+        """Restore any per-param optimizer ``step`` the reshard could not carry.
+
+        Default: nothing. The reshard transfers only param-shaped state (master +
+        moments); the scalar per-param ``step`` is dropped (I-15). For every
+        optimizer here except the CPU-offload one, the step that matters lives in
+        ``param_groups`` (broadcast by ``transfer_opt_param_scheduler``), so no
+        per-param repair is needed. Only HybridDeviceOptimizer's CPU sub-optimizers
+        (stock ``torch.optim.AdamW``) keep the step *per param* — see
+        :meth:`HybridDeviceOptimizerAdapter.repair_per_param_step`.
+        """
+        return
+
+    def release_offload_host_buffers(self) -> None:
+        """Free per-optimizer host-side offload buffers not covered by the
+        param-shaped optimizer-state release (``OptimizerTensorInfo.release``).
+
+        Default: nothing. Only the CPU-offload optimizer (HybridDeviceOptimizer)
+        holds such buffers; see :class:`HybridDeviceOptimizerAdapter`.
+        """
+        return
+
 
 class Float16OptimizerAdapter(OptimizerAdapter):
     """Non-distributed float16 optimizer: master lives in fp32_from_float16_groups."""
@@ -359,3 +388,93 @@ class HybridDeviceOptimizerAdapter(PrecisionAwareOptimizerAdapter):
         self.optimizer.optimizer.dummy_step()
         if offload:
             main_weight.storage().resize_(0)
+
+    def repair_per_param_step(self) -> None:
+        """Seed the offloaded params' per-param Adam ``step`` to the src step.
+
+        HDO's CPU sub-optimizers are stock ``torch.optim.AdamW``, whose bias
+        correction (``1 - beta**t``) reads the PER-PARAM ``state[p]["step"]`` — NOT
+        ``param_groups["step"]`` (only the GPU FusedAdam consumes that one). The
+        reshard never transfers per-param step (dropped as non-param-shaped, I-15)
+        and the dst init's ``dummy_step()`` seeds it to a tensor =1 (one throwaway
+        real step), never corrected to the true src step. Left unrepaired, the dst's
+        offloaded params would resume their first post-reshard step with t=1 bias
+        correction instead of the real src step, diverging the cpu-adam update on
+        exactly the offloaded subset — a silent change the optim-state-multiset
+        verify (master/exp_avg/exp_avg_sq only) cannot see. The agreed src step is
+        already in ``param_groups`` (broadcast by ``transfer_opt_param_scheduler``
+        before this runs); overwrite every CPU sub-optimizer's per-param step with it
+        so the next step increments to src_step+1, matching the src's continuity.
+        Runs on every dst-active rank. FusedAdam params are intentionally left alone —
+        they read the already-correct ``param_groups`` step.
+        """
+        hdo = self.optimizer.optimizer
+        src_step = None
+        for group in hdo.param_groups:
+            if group.get("params") and "step" in group:
+                src_step = group["step"]
+                break
+        if src_step is None:
+            return
+        step_val = (
+            float(src_step.item()) if torch.is_tensor(src_step) else float(src_step)
+        )
+        touched = False
+        for cpu_optimizer in hdo.cpu_optimizers:
+            for param in _optimizer_param_generator(cpu_optimizer):
+                state = cpu_optimizer.state.get(param)
+                if not state or "step" not in state:
+                    continue
+                step_tensor = state["step"]
+                if torch.is_tensor(step_tensor):
+                    step_tensor.fill_(step_val)
+                else:
+                    state["step"] = step_val
+                touched = True
+        # Re-alias hdo.state to the repaired sub-optimizer state dicts (same idiom
+        # dummy_step uses on init); harmless no-op if nothing was offloaded.
+        if touched:
+            hdo._sync_sub_optimizers_state_to_hdo()
+
+    def release_offload_host_buffers(self) -> None:
+        """Free the HDO's pinned CPU grad buffers (``cpu_copy_map_grad`` — POOL B).
+
+        These pinned fp32 grad buffers (one per offloaded param, ~one master's
+        worth per rank) are allocated lazily on the HDO's first step and held for
+        the life of the HDO. The existing optimizer-state release on core
+        (``OptimizerTensorInfo.release`` over the discovered master + moments, i.e.
+        POOL A) resize_(0)'s only those param-shaped state tensors and never reaches
+        these pinned grad buffers, so a strategy cached across reshards keeps its
+        pinned grad buffers resident -> N cached strategies hold N x this pinned
+        block -> host OOM on long multi-strategy cpu-adam runs.
+
+        Called on the *becoming-dormant* (src) gear during release_optimizer. The
+        HDO re-creates these lazily on the gear's next step (the
+        ``if param not in self.cpu_copy_map_grad`` path in
+        ``_set_sub_optimizer_grads``), so reshard-back is unaffected: POOL A is
+        refilled by rebuild()+transfer, POOL B by that lazy step path.
+
+        POOL A is intentionally NOT touched here — it is pageable fp32 already freed
+        by core's ``OptimizerTensorInfo.release()`` loop in
+        ``TrainingState.release_optimizer``.
+        """
+        hdo = self.optimizer.optimizer
+        for param, grad in hdo.cpu_copy_map_grad.items():
+            # The owning sub-optimizer param holds .grad referencing this buffer; drop
+            # that reference, then resize_(0) frees the pinned block in place (returned
+            # to torch's pinned caching pool for the next gear to reuse). resize_(0),
+            # rather than relying on GC, keeps the free deterministic and is the same
+            # idiom EM uses to free POOL A.
+            if param.grad is grad:
+                param.grad = None
+            grad.untyped_storage().resize_(0)
+        # Clear the map so the HDO's lazy path re-creates fresh pinned buffers on the
+        # gear's next step (it keys on `param not in self.cpu_copy_map_grad`).
+        hdo.cpu_copy_map_grad.clear()
+        # NOTE: no trim_host_memory() here. The POOL-B storages are resize_(0)'d above
+        # (returned to torch's pinned pool); the OS reclaim (gc + empty_host_cache +
+        # malloc_trim) is done ONCE by TrainingState.release_optimizer's trailing
+        # trim_host_memory() after this has run for every chained optimizer. Trimming
+        # per-optimizer here meant 2-3 redundant gc.collect()/malloc_trim passes per
+        # reshard (measured ~5-10s total at 30B, ~all of release_optimizer's time);
+        # consolidating to the single caller-side trim removes that redundancy.

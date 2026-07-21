@@ -11,8 +11,9 @@ One-line purpose per file. Read [`README.md`](README.md) first if you have not.
 | [`elastic_megatron/`](../../elastic_megatron/) | The library proper |
 | [`examples/`](../../examples/) | Drop-in patched `training.py` snapshots for Megatron 0.11 (`training_011.py`) and 0.16 (`training_016.py`), plus a README with the three required patch points |
 | [`tools/`](../../tools/) | Offline helpers — ckpt comparators, loss noise-floor estimator, log plotters |
-| [`run_e2e_demo.sh`](../../run_e2e_demo.sh) / [`run_moe.sh`](../../run_moe.sh) | Dense / MoE single-process pretrain launchers; env-var driven |
-| [`run_experiment.sh`](../../run_experiment.sh) | Phase B sweep launcher — wraps the above two with named mode entries (`dense_mix_full`, `moe_mix_full`, etc.) |
+| [`run_dense.sh`](../../run_dense.sh) | llama2 DENSE single-process pretrain launcher; env-var driven (`MODEL_SIZE`/`NUM_LAYERS`/TP/PP/CP) |
+| [`run_qwen3_30b.sh`](../../run_qwen3_30b.sh) | Qwen3-30B-A3B MoE launcher; param-driven (`NUM_LAYERS`/`NUM_EXPERTS`/`MOE_ROUTER_TOPK`/...) so it also serves small MoE smokes |
+| [`examples/strategies/`](../../examples/strategies/) | Reshard sequences as injected override-dict JSON (former `ELASTIC_STRATEGY_MODE` modes), used via `ELASTIC_STRATEGY_LIST_FILE` |
 
 ## `elastic_megatron/`
 

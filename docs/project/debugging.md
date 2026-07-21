@@ -70,7 +70,7 @@ Happens during the transfer phase, or in the first allreduce right after reshard
    NCCL_DEBUG=INFO \
    NCCL_DEBUG_SUBSYS=COLL,INIT,P2P \
    NCCL_DEBUG_FILE=/tmp/nccl_rank_%h_%p.log \
-   ELASTIC_ENABLED=1 ... bash run_moe.sh
+   ELASTIC_ENABLED=1 ... bash run_qwen3_30b.sh
    ```
 
    `NCCL_DEBUG_FILE` with `%p` splits one file per process so you can immediately see "which rank's log stopped at which point". `NCCL_DEBUG_SUBSYS=ALL` is noisy; `COLL,INIT,P2P` is enough.
@@ -123,7 +123,7 @@ Happens during the transfer phase, or in the first allreduce right after reshard
 
 Both asserts share a root cause: the model is built with tied input embedding / output layer (i.e. without `--untie-embeddings-and-output-weights`), at least one strategy in the reshard has `pipeline_model_parallel_size == 1`, and ElasticMegatron's simulated view of the DDP bucket layout disagrees with Megatron's real-run layout. See [invariants.md](invariants.md) I-13 and I-14 for the design rules.
 
-**Quick reproduction.** Drop `--untie-embeddings-and-output-weights` from `run_e2e_demo.sh` (or set `TIE_EMBED=1` if the env-var hook is present) and run any reshard mode whose strategies include PP=1. The first reshard fires the assert.
+**Quick reproduction.** Drop `--untie-embeddings-and-output-weights` from `run_dense.sh` (or set `TIE_EMBED=1` if the env-var hook is present) and run any reshard sequence whose strategies include PP=1. The first reshard fires the assert.
 
 **Two distinct asserts to recognise:**
 

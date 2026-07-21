@@ -1,3 +1,5 @@
+import os
+import time
 from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from logging import Logger
@@ -24,6 +26,20 @@ from .resharding.resharding_metadata import OptimizerTensorInfo
 from .resharding.util import Timer, get_megatron_version_minor
 from .resharding.virtual_param import VirtualParamSpace, build_virtual_model
 from .transfer.transfer import TransferManager
+
+
+def _log_reshard_phase(name: str, t_start: float, logger: Logger | None) -> None:
+    """Gated per-reshard phase timing (ELASTIC_RESHARD_PHASE_TIMING=1), rank-0 only."""
+    if os.environ.get("ELASTIC_RESHARD_PHASE_TIMING", "0") != "1":
+        return
+    dt_ms = (time.perf_counter() - t_start) * 1000.0
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if rank == 0:
+        msg = f"[ElasticMegatron-Perf] : reshard-phase {name}: {dt_ms:.2f} ms"
+        if logger is not None:
+            logger.info(msg)
+        else:
+            print(msg, flush=True)
 
 
 class ElasticMegatronManager:
@@ -238,11 +254,15 @@ class ElasticMegatronManager:
 
         # Step-4 : Fully release src training state
         if src_megatron_state.training_state is not None:
+            _t_release = time.perf_counter()
             src_megatron_state.training_state.release_optimizer()
+            _log_reshard_phase("release_optimizer", _t_release, logger)
 
         # Step-5 : Update model weight.
         if dst_megatron_state.training_state is not None:
+            _t_update = time.perf_counter()
             dst_megatron_state.training_state.update_model_weight()
+            _log_reshard_phase("update_model_weight", _t_update, logger)
 
         # Step-6 : Collect communication info
         self.log_communication_info(transfer_time, union_world_group, logger)

@@ -1,0 +1,7 @@
+[
+  {},
+  {
+    "world_size": 4,
+    "expert_tensor_parallel_size": 1
+  }
+]

@@ -1,5 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+# STALE (0.16-only refactor): this 0.11 sibling still uses the old hardcoded
+# ELASTIC_STRATEGY_MODE strategy-list machinery. The 0.16 mirror training_016.py was
+# refactored to inject the strategy list from the launcher (ELASTIC_STRATEGY_LIST /
+# ELASTIC_STRATEGY_LIST_FILE); this file was intentionally NOT updated. Port the same
+# thinning here if 0.11 is revived. See docs/project/cross_repo.md.
+
 """Pretrain utilities."""
 
 import dataclasses
