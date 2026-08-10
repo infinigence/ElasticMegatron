@@ -199,7 +199,7 @@ The `reshard()` method performs the following steps:
 
 ## Citation
 
-If you find DynaTrain helpful, please cite the paper:
+If you find ElasticMegatron helpful, please cite the paper:
 
 ```bibtex
 @misc{wang2026dynatrainfastonlineparallelism,
