@@ -196,3 +196,19 @@ The `reshard()` method performs the following steps:
 - **CPU Optimizer**: CPU optimizer scenarios are not yet supported
 - **VPP and hetero-pp**: VPP and hetero-pp support is planned
 - **FSDP**: FSDP2 and megatron custom-FSDP support is planned
+
+## Citation
+
+If you find DynaTrain helpful, please cite the paper:
+
+```bibtex
+@misc{wang2026dynatrainfastonlineparallelism,
+      title={DynaTrain: Fast Online Parallelism Switching for Elastic LLM Training}, 
+      author={Yuanqing Wang and Yuchen Zhang and Hao Lin and Junhao Hu and Chunyang Zhu and Quanlu Zhang and Boxun Li and Guohao Dai and Zhi Yang and Daning Cheng and Yunquan Zhang and Yu Wang},
+      year={2026},
+      eprint={2605.18815},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2605.18815}, 
+}
+```
