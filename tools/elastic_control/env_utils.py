@@ -1,11 +1,13 @@
+import json
 import os
 import torch
 import socket
+import subprocess
+import shlex
 from multiprocessing import shared_memory
 from pathlib import Path
 from multiprocessing import Process, sys
 from megatron.training.global_vars import get_args
-from elastic_megatron import ElasticMegatronManager, meta_device_context
 from elastic_megatron.transfer.ipc_manager import (
     receive_training_state,
     _map_ipc_data,
@@ -26,23 +28,75 @@ _SHM_HANDLE = None
 _ELASTIC_SHM = None
 
 
+def _parse_elastic_trigger_iters():
+    """Parse elastic trigger iters from env"""
+    scale_up_env = os.environ.get("ELASTIC_SCALE_UP_ITER", "2")
+    scale_up_iter = int(scale_up_env) if scale_up_env != "" else None
+
+    scale_down_env = os.environ.get("ELASTIC_SCALE_DOWN_ITER", "3000")
+    scale_down_iter = int(scale_down_env) if scale_down_env != "" else None
+
+    trigger_iters = set()
+    if scale_up_iter is not None:
+        trigger_iters.add(scale_up_iter)
+    if scale_down_iter is not None:
+        trigger_iters.add(scale_down_iter)
+
+    return scale_up_iter, scale_down_iter, trigger_iters
+
+
 def get_deleted_node_rank():
     global _DELETED_NODE_RANK
     return _DELETED_NODE_RANK
 
 
+def _parse_deleted_ranks_from_env():
+    raw = os.environ.get("ELASTIC_DELETED_RANKS", "").strip()
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            out.append(int(part))
+    return out
+
+
+def _parse_new_node_ip_list_from_env():
+    raw = os.environ.get("ELASTIC_NEW_NODE_IP_LIST", "").strip()
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, list):
+        return None
+    return data
+
+
 def set_deleted_node_rank():
     global _DELETED_NODE_RANK
-    _DELETED_NODE_RANK = [4, 5, 6, 7]
+    _DELETED_NODE_RANK = _parse_deleted_ranks_from_env()
 
 
 def set_new_node_ip_list():
     global NEW_NODE_IP_LIST
-    NEW_NODE_IP_LIST = [["10.212.106.223", 23455, 1]]
+    parsed = _parse_new_node_ip_list_from_env()
+    NEW_NODE_IP_LIST = parsed if parsed is not None else []
 
 
 set_new_node_ip_list()
 set_deleted_node_rank()
+
+
+def _get_rdzv_master():
+    """Torchrun rendezvous host from env"""
+    for key in ("ELASTIC_RENDEZVOUS_MASTER_ADDR", "MASTER_ADDR"):
+        val = (os.environ.get(key) or "").strip()
+        if val:
+            return val
+    return None
 
 
 def get_shm_handle():
@@ -69,16 +123,39 @@ def _get_ready_flag():
     """
     Check if the new node is ready via shared memory.
     """
-    if get_shm_handle() is None:
-        shm_name = os.getenv("NEW_NODE_READY_SHM")
-        if shm_name:
+    shm_name = os.getenv("NEW_NODE_READY_SHM")
+    if not shm_name:
+        return 0
+
+    current_shm = get_shm_handle()
+    if current_shm is None or current_shm.name != shm_name:
+        if current_shm is not None:
             try:
-                set_shm_handle(shared_memory.SharedMemory(name=shm_name))
-            except FileNotFoundError:
-                return 0
-        else:
+                current_shm.close()
+            except Exception:
+                pass
+        try:
+            set_shm_handle(shared_memory.SharedMemory(name=shm_name))
+        except FileNotFoundError:
             return 0
+
     return get_shm_handle().buf[0]
+
+
+def _reset_ready_flag():
+    """Reset ready flag in shared memory (rank0 only)."""
+    if not torch.distributed.is_initialized():
+        return
+    if torch.distributed.get_rank() != 0:
+        return
+    shm_name = ElasticEnv.get_ready_shm_name()
+    if not shm_name:
+        return
+    try:
+        shm = shared_memory.SharedMemory(name=shm_name)
+        shm.buf[0] = 0
+    except FileNotFoundError:
+        return
 
 
 def get_new_node_ip_list():
@@ -86,12 +163,76 @@ def get_new_node_ip_list():
 
 
 def trigger_new_node():
-    """send signal to new nodes to join"""
+    """Launch scale-up new nodes through ssh from rank0."""
     nodes_info = get_new_node_ip_list()
-    if torch.distributed.get_rank() == 0:
-        for idx, (node_addr, node_port, _) in enumerate(nodes_info):
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((node_addr, node_port))
+    if not nodes_info or torch.distributed.get_rank() != 0:
+        return
+
+    ssh_user = os.getenv("ELASTIC_OVERLAY_REMOTE_USER")
+    gpus_per_node = int(os.environ.get("GPUS_PER_NODE", "8"))
+    log_dir = Path(os.environ.get("LOG_DIR", "log"))
+    log_dir.mkdir(parents=True, exist_ok=True)
+    script_path = "run_e2e_demo.sh"
+    workdir = str(Path(__file__).resolve().parents[2])
+    venv_activate = os.environ.get(
+        "ELASTIC_SCALEUP_VENV_ACTIVATE",
+        os.environ.get("VENV_ACTIVATE", "/path/to/your/venv/bin/activate"),
+    )
+    master_addr = _get_rdzv_master()
+    if not master_addr:
+        raise RuntimeError(
+            "scale-up SSH requires ELASTIC_RENDEZVOUS_MASTER_ADDR or MASTER_ADDR in the "
+            "training process environment (bash-only defaults in run_e2e_demo.sh are not visible here)."
+        )
+    master_port = str(int(os.environ.get("MASTER_PORT", "6368")) + 1)
+    nnodes = os.environ.get("ELASTIC_TARGET_NNODES", os.environ.get("NNODES", "2"))
+    tp = os.environ.get("ELASTIC_TARGET_TP", os.environ.get("TP", "2"))
+    pp = os.environ.get("ELASTIC_TARGET_PP", os.environ.get("PP", "8"))
+
+    for idx, (node_addr, _node_port, node_rank) in enumerate(nodes_info):
+        remote_target = f"{ssh_user}@{node_addr}" if ssh_user else str(node_addr)
+        log_file = log_dir / f"new_megatron_scaleup_remote_{str(node_addr).replace('.', '_')}.log"
+        remote_exports = [
+            "export NEW_PROCESS=1",
+            "export NEW_PROCESS_SCALE_UP=1",
+            "export NEW_NODE=1",
+            f"export MASTER_ADDR={shlex.quote(str(master_addr))}",
+            f"export MASTER_PORT={shlex.quote(master_port)}",
+            f"export GPUS_PER_NODE={gpus_per_node}",
+            f"export NNODES={shlex.quote(str(nnodes))}",
+            f"export TP={shlex.quote(str(tp))}",
+            f"export PP={shlex.quote(str(pp))}",
+            f"export NODE_RANK={int(node_rank)}",
+            f"export RANK={int(node_rank)}",
+        ]
+        for key, value in os.environ.items():
+            if key.startswith("ELASTIC_") and key != "ELASTIC_RENDEZVOUS_MASTER_ADDR":
+                remote_exports.append(f"export {key}={shlex.quote(str(value))}")
+        remote_exports.append(
+            f"export ELASTIC_RENDEZVOUS_MASTER_ADDR={shlex.quote(str(master_addr))}"
+        )
+
+        remote_cmd = (
+            "bash -lc "
+            + shlex.quote(
+                f"cd {workdir} && "
+                + f"[ -f {shlex.quote(venv_activate)} ] && source {shlex.quote(venv_activate)}; "
+                + " && ".join(remote_exports)
+                + f" && bash {script_path}"
+            )
+        )
+        print(
+            f"[elastic-ssh-scaleup] launch idx={idx} target={remote_target} "
+            f"node_rank={node_rank} master={master_addr}:{master_port} "
+            f"nnodes={nnodes} tp={tp} pp={pp}"
+        )
+        remote_log = open(log_file, "a")
+        subprocess.Popen(
+            ["ssh", remote_target, remote_cmd],
+            stdout=remote_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
     return
 
 
@@ -211,7 +352,7 @@ def _exec_wrapper(cmd, args, env, log_file):
     os.execvpe(cmd, args, env)
 
 
-def _start_new_megatron_proc(scale_action):
+def _start_new_megatron_proc(scale_action, redeploy_script_path=None, node1_ip=None):
     """
     start new megatron process for scale up or scale down:
         1. create shared memory as ready signal
@@ -219,15 +360,21 @@ def _start_new_megatron_proc(scale_action):
         3. start new megatron process
         4. for scale down, start two new megatron processes
         5. log new megatron process output to log files
-    """
-    from megatron.training.training import get_parallel_strategy_list
 
+    If redeploy_script_path is provided, use a dedicated redeployment path
+    and start one 8-GPU training process from the provided script.
+    If node1_ip is provided together with redeploy_script_path, also start
+    the same script on node1 with REDEPLOY=1 via ssh.
+    """
     pass_env_list = [
         "PATH",
         "PYTHONPATH",
         "LD_LIBRARY_PATH",
     ]
     new_env = {key: os.environ[key] for key in pass_env_list if key in os.environ}
+    for key, value in os.environ.items():
+        if key.startswith("ELASTIC_"):
+            new_env[key] = value
 
     shm = shared_memory.SharedMemory(create=True, size=1)
     shm.buf[0] = 0
@@ -238,9 +385,17 @@ def _start_new_megatron_proc(scale_action):
     new_env["NEW_NODE_READY_SHM"] = shm.name
 
     if scale_action == ElasticMode.SCALE_DOWN:
+        scale_down_ipc_base = int(os.environ.get("ELASTIC_IPC_PORT_SCALE_DOWN", "7000"))
+        os.environ["ELASTIC_IPC_PORT"] = str(scale_down_ipc_base)
+        new_env["ELASTIC_IPC_PORT"] = str(scale_down_ipc_base)
+
         new_env_proc_2 = {
             key: os.environ[key] for key in pass_env_list if key in os.environ
         }
+        for key, value in os.environ.items():
+            if key.startswith("ELASTIC_"):
+                new_env_proc_2[key] = value
+        new_env_proc_2["ELASTIC_IPC_PORT"] = str(scale_down_ipc_base)
         new_env_proc_2["NEW_NODE_READY_SHM"] = shm.name
         # for scale down, two process are needed to cover the communication build time cost,
         # therefore a shared memory with two bytes is created to record the ready status of two processes
@@ -264,14 +419,68 @@ def _start_new_megatron_proc(scale_action):
     log_path_2 = (
         log_dir / f"new_megatron_proc2_{hostname}_rank{rank}_local{local_rank}.log"
     )
-    if os.environ.get("RANK") == "0":
-        new_env["RANK"] = os.environ.get("RANK")
-    else:
-        new_env["RANK"] = "1"
+
+    # Redeployment
+    if redeploy_script_path:
+        new_env["NEW_PROCESS_REDEPLOY"] = "1"
+        new_env["REDEPLOY"] = "0"
+        new_env["NNODES"] = "1"
+        new_env["MASTER_PORT"] = str(int(os.environ.get("MASTER_PORT")) + 3)
+        # hardcode for 8-GPU redeployment
+        new_env["GPUS_PER_NODE"] = "8"
+
+        script_path = str(Path(redeploy_script_path).expanduser())
+        log_path_redeploy = (
+            log_dir / f"new_megatron_redeploy_{hostname}_rank{rank}_local{local_rank}.log"
+        )
+        p_redeploy = Process(
+            target=_exec_wrapper,
+            args=("bash", ["bash", script_path], new_env, log_path_redeploy),
+        )
+        p_redeploy.start()
+
+        if node1_ip:
+            ssh_user = os.getenv("ELASTIC_OVERLAY_REMOTE_USER")
+            remote_target = f"{ssh_user}@{node1_ip}" if ssh_user else node1_ip
+            remote_workdir = str(Path(script_path).resolve().parent)
+            remote_script = script_path
+            remote_cmd = (
+                "bash -lc "
+                + shlex.quote(
+                    f"cd {remote_workdir} && "
+                    f"export REDEPLOY=1 && "
+                    f"bash {shlex.quote(remote_script)}"
+                )
+            )
+            remote_log_path = log_dir / (
+                f"new_megatron_redeploy_remote_{str(node1_ip).replace('.', '_')}.log"
+            )
+            remote_log = open(remote_log_path, "a")
+            subprocess.Popen(
+                ["ssh", remote_target, remote_cmd],
+                stdout=remote_log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        return
 
     # all existing nodes start process 2 for scale down (using communication group before scale down)
     if scale_action == ElasticMode.SCALE_DOWN:
+        from megatron.training.training import get_parallel_strategy_list
+
+        gpus_per_node = int(os.environ.get("GPUS_PER_NODE", "8"))
+        node_rank = int(os.environ.get("RANK", "0")) // gpus_per_node
+        parallel_strategy_list = get_parallel_strategy_list()
+        cur_strategy = parallel_strategy_list[0]
+        tgt_strategy = parallel_strategy_list[1]
+
+        new_env["TP"] = str(cur_strategy["tensor_model_parallel_size"])
+        new_env["PP"] = str(cur_strategy["pipeline_model_parallel_size"])
+
         new_env["NEW_PROCESS_SCALE_DOWN_SENDER"] = "1"
+        new_env["GPUS_PER_NODE"] = str(gpus_per_node)
+        new_env["RANK"] = str(node_rank)
+        new_env["NODE_RANK"] = str(node_rank)
 
         new_env["MASTER_PORT"] = str(int(os.environ.get("MASTER_PORT")) + 1)
         p2 = Process(
@@ -283,44 +492,146 @@ def _start_new_megatron_proc(scale_action):
         # only surviving nodes start process 1 for scale down (using communication group after scale down)
         if torch.distributed.get_rank() not in get_deleted_node_rank():
             new_env_proc_2["NEW_PROCESS_SCALE_DOWN_RECEIVER"] = "1"
-            new_env_proc_2["RANK"] = os.environ.get("RANK")
-            new_env_proc_2["MASTER_PORT"] = str(int(os.environ.get("MASTER_PORT")) + 2)
+            new_env_proc_2["GPUS_PER_NODE"] = str(gpus_per_node)
+            new_env_proc_2["RANK"] = str(node_rank)
+            new_env_proc_2["NODE_RANK"] = str(node_rank)
+            new_env_proc_2["MASTER_PORT"] = str(
+                int(os.environ.get("MASTER_PORT")) + 2
+            )
             new_env_proc_2["ELASTIC_IPC_PORT"] = str(
-                int(os.environ.get("ELASTIC_IPC_PORT", "6000"))
+                int(os.environ.get("ELASTIC_IPC_PORT", str(scale_down_ipc_base)))
                 + torch.cuda.device_count()
             )
 
-            # from env_utils import get_new_node_ip_list
-            # TODO:: nnodes assignemnt
-            new_env_proc_2["NNODES"] = "1"
-            # new_env_proc_2["NNODES"] = str(int(os.getenv("NNODES")) - int(len(get_new_node_ip_list())))
-            new_env_proc_2["PP"] = str(
-                get_parallel_strategy_list()[1]["pipeline_model_parallel_size"]
-            )
-            new_env_proc_2["TP"] = str(
-                get_parallel_strategy_list()[1]["tensor_model_parallel_size"]
-            )
+            new_env_proc_2["NNODES"] = str(os.environ.get("ELASTIC_TARGET_NNODES"))
+            new_env_proc_2["PP"] = str(tgt_strategy["pipeline_model_parallel_size"])
+            new_env_proc_2["TP"] = str(tgt_strategy["tensor_model_parallel_size"])
             p = Process(
                 target=_exec_wrapper,
                 args=("bash", ["bash", "run_e2e_demo.sh"], new_env_proc_2, log_path),
             )
             p.start()
 
-    else:  # Hardcode for 2 nodes case
+    else:
         new_env["NEW_PROCESS_SCALE_UP"] = "1"
-        new_env["RANK"] = os.environ.get("RANK")
+        new_env["GPUS_PER_NODE"] = os.environ.get("GPUS_PER_NODE")
+        new_env["RANK"] = str(int(os.environ.get("RANK"))//int(new_env["GPUS_PER_NODE"]))
+        
+
         new_env["MASTER_PORT"] = str(int(os.environ.get("MASTER_PORT")) + 1)
-        new_env["NNODES"] = "2"
-        # TODO:: nnodes assignemnt
-        # new_env["PP"] = str(get_parallel_strategy_list()[1]["pipeline_model_parallel_size"])
-        new_env["PP"] = "2"
-        # new_env["TP"] = str(get_parallel_strategy_list()[1]["tensor_model_parallel_size"])
-        new_env["TP"] = "1"
+        _rdzv = _get_rdzv_master()
+        if _rdzv:
+            new_env["MASTER_ADDR"] = _rdzv
+            new_env["ELASTIC_RENDEZVOUS_MASTER_ADDR"] = _rdzv
+
+        nnodes = os.environ.get(
+            "ELASTIC_TARGET_NNODES", os.environ.get("NNODES", "2")
+        )
+        pp = os.environ.get("ELASTIC_TARGET_PP", os.environ.get("PP", "8"))
+        tp = os.environ.get("ELASTIC_TARGET_TP", os.environ.get("TP", "2"))
+        new_env["NNODES"] = str(nnodes)
+        new_env["PP"] = str(pp)
+        new_env["TP"] = str(tp)
         p = Process(
             target=_exec_wrapper,
             args=("bash", ["bash", "run_e2e_demo.sh"], new_env, log_path),
         )
         p.start()
+
+
+def _warmup_communication_groups():
+    """Warm up NCCL communicators with tiny tensors before elastic resharding."""
+    if not torch.distributed.is_initialized():
+        return
+
+    rank = torch.distributed.get_rank()
+
+    dummy = torch.ones(1, device="cuda")
+
+    # Warm up world group first.
+    torch.distributed.all_reduce(dummy)
+
+    try:
+        from megatron.core import mpu
+
+        # Warm up common Megatron communication groups.
+        for getter_name in [
+            "get_tensor_model_parallel_group",
+            "get_pipeline_model_parallel_group",
+            "get_data_parallel_group",
+        ]:
+            getter = getattr(mpu, getter_name, None)
+            if getter is None:
+                continue
+            group = getter()
+            if group is None:
+                continue
+            if torch.distributed.get_world_size(group=group) > 1:
+                torch.distributed.all_reduce(dummy, group=group)
+
+        torch.distributed.barrier()
+
+    except Exception as e:
+        if rank == 0:
+            print(f"[Elastic-Perf] warmup skipped due to error: {e}")
+
+
+def _warmup_p2p_collective_groups():
+    """Warm up 2-rank NCCL groups used by P2P-to-collective transfer."""
+    print(f"process {os.getpid()} warming up p2p collective groups...")
+    if not torch.distributed.is_initialized():
+        return
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        return
+
+    try:
+        from elastic_megatron.distributed.elastic_process_group import (
+            create_p2p_collective_groups,
+            get_p2p_collective_group,
+        )
+    except Exception:
+        return
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    if world_size <= 1:
+        return
+
+    create_p2p_collective_groups()
+
+    dummy = torch.empty(1, device="cuda", dtype=torch.int32)
+    for i in range(world_size):
+        for j in range(i + 1, world_size):
+            if rank != i and rank != j:
+                continue
+            group = get_p2p_collective_group(ranks=[i, j], backend="nccl")
+            if rank == i:
+                dummy.fill_(1)
+            torch.distributed.broadcast(dummy, src=i, group=group.group)
+
+    torch.distributed.barrier()
+
+
+def _warmup_elastic_communication_before_ipc():
+    import time
+
+    if not torch.distributed.is_initialized():
+        return
+
+    rank = torch.distributed.get_rank()
+    t0 = time.perf_counter()
+
+    _warmup_communication_groups()
+
+    _warmup_p2p_collective_groups()
+
+    t1 = time.perf_counter()
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
 
 
 def meta_resharding_for_inter_process(
@@ -332,6 +643,8 @@ def meta_resharding_for_inter_process(
         get_parallel_strategy_list,
     )
 
+    _warmup_elastic_communication_before_ipc()
+
     # Init signaling for scale_down_receiver (Process 2 Ready)
     if ElasticEnv.is_scale_down_receiver():
         counter_shm = shared_memory.SharedMemory(name=ElasticEnv.get_counter_shm_name())
@@ -339,6 +652,7 @@ def meta_resharding_for_inter_process(
             counter_shm.buf[1] = 1
 
     # Step-1 : Build model(after sacle-up) in meta device
+    from elastic_megatron import meta_device_context
     with meta_device_context():
         meta_model, meta_optimizer, meta_opt_param_scheduler = (
             setup_model_and_optimizer(
@@ -353,6 +667,7 @@ def meta_resharding_for_inter_process(
 
     if ElasticEnv.is_scale_down_receiver():
         parallel_strategy_list_1 = [parallel_strategy_list[0]]
+        from elastic_megatron import ElasticMegatronManager
         meta_elastic_megatron_manager = ElasticMegatronManager(
             parallel_strategy_list_1,
             meta_model,
@@ -361,6 +676,7 @@ def meta_resharding_for_inter_process(
         )
         training_state = meta_elastic_megatron_manager.state_manager.training_state
     else:
+        from elastic_megatron import ElasticMegatronManager
         meta_elastic_megatron_manager = ElasticMegatronManager(
             parallel_strategy_list, meta_model, meta_optimizer, meta_opt_param_scheduler
         )
@@ -378,7 +694,6 @@ def meta_resharding_for_inter_process(
             training_state = meta_elastic_megatron_manager.reshard(
                 parallel_strategy_list[1], is_meta_device=True
             )
-
     args = get_args()
     consumed_samples_tensor = torch.tensor(0, dtype=torch.long, device="cuda")
     iter_idx_tensor = torch.tensor(0, dtype=torch.long, device="cuda")
@@ -410,6 +725,9 @@ def meta_resharding_for_inter_process(
 
         # 2. receive ipc data from old-process
         state = receive_training_state()
+
+        # Clear stale ready signal
+        _reset_ready_flag()
         # 3. copy
         ipc_optimizer_tensors_list = _map_ipc_data(training_state, state)
         misc = state["misc"]
@@ -442,6 +760,7 @@ def meta_resharding_for_inter_process(
             training_state = meta_elastic_megatron_manager.reshard(
                 parallel_strategy_list[1]
             )
+
             # deleted node exit
             if training_state is None:
                 os._exit(0)

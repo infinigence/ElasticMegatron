@@ -117,7 +117,7 @@ def send_training_state(
         misc["iter_idx"] = args.iteration
 
     payload = {"tensor_handles": share_dict, "misc": misc}
-    from tools.agent.env_utils import _get_zmq_ports
+    from tools.elastic_control.env_utils import _get_zmq_ports
 
     port = _get_zmq_ports(base_port=base_port)
     sock = get_zmq_ctx().socket(zmq.REQ)
@@ -136,7 +136,7 @@ def receive_training_state():
     """
     receive the training state (from IPC)
     """
-    from tools.agent.env_utils import _get_zmq_ports
+    from tools.elastic_control.env_utils import _get_zmq_ports
 
     port = _get_zmq_ports()
     sock = get_zmq_ctx().socket(zmq.REP)
